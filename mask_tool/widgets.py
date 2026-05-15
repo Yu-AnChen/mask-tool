@@ -513,7 +513,9 @@ class ThresholdWidget(QWidget):
 
     def _on_invert_changed(self):
         if self._preview_layer is not None:
-            self._preview_layer.colormap = _threshold_colormap(self._invert.isChecked())
+            inv = self._invert.isChecked()
+            self._preview_layer.colormap = _threshold_colormap(inv)
+            self._preview_layer.blending = "translucent" if inv else "additive"
 
     def _on_add_preview(self):
         src_name = self._layer_combo.currentText()
@@ -544,7 +546,9 @@ class ThresholdWidget(QWidget):
 
         mask_scale, mask_translate = _compute_mask_transform(src_layer, img.shape)
         pre_name = _pre_name(src_layer.name)
-        cmap = _threshold_colormap(self._invert.isChecked())
+        inv = self._invert.isChecked()
+        cmap = _threshold_colormap(inv)
+        blending = "translucent" if inv else "additive"
         clim = (float(img.min()), float(img.max()))
 
         if pre_name in self._viewer.layers:
@@ -554,7 +558,7 @@ class ThresholdWidget(QWidget):
             lyr.scale = mask_scale
             lyr.translate = mask_translate
             # contrast_limits not reset — preserves the user's threshold
-            lyr.blending = "additive"
+            lyr.blending = blending
             lyr.opacity = 0.5
             pre_layer = lyr
         else:
@@ -562,7 +566,7 @@ class ThresholdWidget(QWidget):
                 img, name=pre_name, colormap=cmap,
                 scale=mask_scale, translate=mask_translate,
                 contrast_limits=clim,
-                blending="additive",
+                blending=blending,
                 opacity=0.5,
             )
 
