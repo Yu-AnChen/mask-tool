@@ -69,20 +69,15 @@ def _get_layer_data_2d(viewer: "napari.Viewer", name: str, channel_idx: int) -> 
     import dask.array as da
     lyr = viewer.layers[name]
     data = lyr.data
-    # multiscale: list of arrays — take level 0 (full res)
-    if isinstance(data, list):
+    # multiscale: MultiScaleData, list, or any non-array sequence — take level 0 (full res)
+    if not isinstance(data, (np.ndarray, da.Array)):
         data = data[0]
-    if isinstance(data, np.ndarray) and data.ndim == 2:
+    if data.ndim == 2:
         return data
-    if isinstance(data, np.ndarray) and data.ndim == 3:
-        return data[channel_idx]
-    if isinstance(data, da.Array) and data.ndim == 2:
-        return data
-    if isinstance(data, da.Array) and data.ndim == 3:
+    if data.ndim == 3:
         return data[channel_idx]
     raise ValueError(
-        f"Layer {name!r} has unexpected data shape {np.shape(data)}; "
-        "expected 2-D or 3-D (C, H, W)."
+        f"Layer {name!r} has data ndim={data.ndim}; expected 2 or 3 (C, H, W)."
     )
 
 
@@ -149,14 +144,14 @@ class ChannelMaskWidget(Container):
 
     def _on_layer_changed(self, layer_name: str | None):
         """Show/hide channel index depending on whether the layer is multichannel."""
+        import dask.array as da
         if not layer_name or layer_name not in self._viewer.layers:
             self._channel.visible = False
             return
         data = self._viewer.layers[layer_name].data
-        if isinstance(data, list):
+        if not isinstance(data, (np.ndarray, da.Array)):
             data = data[0]
-        ndim = data.ndim if hasattr(data, "ndim") else len(np.shape(data))
-        self._channel.visible = ndim > 2
+        self._channel.visible = data.ndim > 2
 
     def _on_bg_toggle(self, value):
         self._rb_rad.visible = bool(value)
