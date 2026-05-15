@@ -1,27 +1,22 @@
 """
 Lazy anti-aliasing downscale for large 2-D dask arrays.
 
-Uses dask.array.overlap so every output pixel has full INTER_AREA kernel
-support at chunk boundaries — no aliasing seams for non-integer scale factors.
+Chunks are aligned to INTER_AREA kernel boundaries (multiples of the scale
+denominator) so chunk-independent resize is pixel-identical to a full-image
+resize — no seams at chunk boundaries.
 """
 
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 
 import cv2
 import numpy as np
 import dask.array as da
-from dask.array.overlap import overlap as _da_overlap
 
 
-def _resize_block(
-    block: np.ndarray,
-    *,
-    scale: float,
-    depth_out: int,
-    block_info=None,
-) -> np.ndarray:
+def _resize_block(block: np.ndarray, *, scale: float, block_info=None) -> np.ndarray:
     resized = cv2.resize(
         block,
         dsize=None,
@@ -29,21 +24,34 @@ def _resize_block(
         fy=scale,
         interpolation=cv2.INTER_AREA,
     )
-    d = depth_out
-    trimmed = resized[d:-d, d:-d]
-
-    # enforce exact declared chunk size — INTER_AREA rounding can give ±1 pixel
     if block_info is not None:
         th, tw = block_info[None]["chunk-shape"]
-        ah, aw = trimmed.shape
+        ah, aw = resized.shape
         if ah < th or aw < tw:
-            trimmed = np.pad(
-                trimmed,
+            resized = np.pad(
+                resized,
                 ((0, max(0, th - ah)), (0, max(0, tw - aw))),
                 mode="edge",
             )
-        trimmed = trimmed[:th, :tw]
-    return trimmed
+        resized = resized[:th, :tw]
+    return resized
+
+
+def _make_chunks(dim_size: int, aligned: int, min_chunk: int) -> tuple[int, ...]:
+    """
+    Chunk `dim_size` into pieces of `aligned` pixels, ensuring the last
+    (remainder) chunk is at least `min_chunk` — if not, absorb it into the
+    previous chunk so cv2.resize always produces ≥1 output pixel per chunk.
+    """
+    if dim_size <= aligned:
+        return (dim_size,)
+    full, rem = divmod(dim_size, aligned)
+    if rem == 0:
+        return (aligned,) * full
+    if rem >= min_chunk:
+        return (aligned,) * full + (rem,)
+    # remainder too small to produce any output — absorb into previous chunk
+    return (aligned,) * (full - 1) + (aligned + rem,)
 
 
 def lazy_resize(
@@ -58,7 +66,7 @@ def lazy_resize(
     ----------
     x          : 2-D dask array (any numeric dtype)
     scale      : target_px_size / source_px_size  (< 1 for downscaling)
-    chunk_size : source-space chunk edge in pixels
+    chunk_size : source-space chunk edge in pixels (rounded up to scale denominator)
     """
     if abs(scale - 1.0) < 1e-9:
         return x
@@ -66,10 +74,19 @@ def lazy_resize(
     if x.ndim != 2:
         raise ValueError(f"lazy_resize expects a 2-D array, got shape {x.shape}")
 
-    depth_in = math.ceil(1.0 / scale)
-    depth_out = max(1, round(depth_in * scale))
+    # Align chunk size to the denominator of scale (in lowest terms) so that
+    # INTER_AREA kernel boundaries fall exactly on chunk edges — no partial
+    # pixels straddle chunk boundaries, giving seam-free results.
+    q = Fraction(scale).limit_denominator(1000).denominator
+    aligned = ((chunk_size + q - 1) // q) * q  # round up to next multiple of q
 
-    x = x.rechunk({0: chunk_size, 1: chunk_size})
+    # cv2.resize errors when output dimension rounds to 0; guard the last
+    # (potentially small remainder) chunk: need input >= ceil(0.5 / scale)
+    min_chunk = math.ceil(0.5 / scale)
+
+    chunks_0 = _make_chunks(x.shape[0], aligned, min_chunk)
+    chunks_1 = _make_chunks(x.shape[1], aligned, min_chunk)
+    x = x.rechunk({0: chunks_0, 1: chunks_1})
 
     def _cumulative_chunks(in_chunks: tuple[int, ...]) -> tuple[int, ...]:
         """
@@ -83,15 +100,9 @@ def lazy_resize(
         return tuple(out)
 
     out_chunks = tuple(_cumulative_chunks(dim) for dim in x.chunks)
-
     src_dtype = x.dtype
-    x_ghost = _da_overlap(
-        x,
-        depth={0: depth_in, 1: depth_in},
-        boundary="reflect",
-    )
 
     def _block(block, block_info=None):
-        return _resize_block(block, scale=scale, depth_out=depth_out, block_info=block_info)
+        return _resize_block(block, scale=scale, block_info=block_info)
 
-    return da.map_blocks(_block, x_ghost, chunks=out_chunks, dtype=src_dtype)
+    return da.map_blocks(_block, x, chunks=out_chunks, dtype=src_dtype)
