@@ -136,20 +136,20 @@ def _params_to_rows(params: dict) -> list[tuple[str, str]]:
 
 def _image_layers(viewer: "napari.Viewer") -> list[str]:
     import napari.layers
-    return [lyr.name for lyr in viewer.layers if isinstance(lyr, napari.layers.Image)]
+    return [lyr.name for lyr in reversed(viewer.layers) if isinstance(lyr, napari.layers.Image)]
 
 
 def _image_layers_no_pre(viewer: "napari.Viewer") -> list[str]:
     import napari.layers
     return [
-        lyr.name for lyr in viewer.layers
+        lyr.name for lyr in reversed(viewer.layers)
         if isinstance(lyr, napari.layers.Image) and not lyr.name.startswith("pre-")
     ]
 
 
 def _labels_layers(viewer: "napari.Viewer") -> list[str]:
     import napari.layers
-    return [lyr.name for lyr in viewer.layers if isinstance(lyr, napari.layers.Labels)]
+    return [lyr.name for lyr in reversed(viewer.layers) if isinstance(lyr, napari.layers.Labels)]
 
 
 def _refresh_combo(combo: QComboBox, choices: list[str]) -> None:
