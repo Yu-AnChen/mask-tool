@@ -674,9 +674,16 @@ class ThresholdWidget(QWidget):
 class _MaskRow(QWidget):
     """One row: [op ▾] [layer ▾] [−]"""
 
-    def __init__(self, viewer: "napari.Viewer", first: bool = False, parent=None):
+    def __init__(
+        self,
+        viewer: "napari.Viewer",
+        first: bool = False,
+        filter_shape: tuple | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._viewer = viewer
+        self._first = first
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -704,11 +711,25 @@ class _MaskRow(QWidget):
             layout.addWidget(rm_btn)
             self._rm_btn = rm_btn
 
-        self._first = first
-        self.refresh_layers()
+        self.refresh_layers(filter_shape=filter_shape)
 
-    def refresh_layers(self):
-        _refresh_combo(self.layer_combo, _labels_layers(self._viewer))
+    def refresh_layers(self, filter_shape: tuple | None = None):
+        import napari.layers
+        current = self.layer_combo.currentData()
+        self.layer_combo.blockSignals(True)
+        self.layer_combo.clear()
+        for lyr in reversed(self._viewer.layers):
+            if not isinstance(lyr, napari.layers.Labels):
+                continue
+            if filter_shape is not None and lyr.data.shape != filter_shape:
+                continue
+            scale = lyr.scale[-1]
+            self.layer_combo.addItem(f"{lyr.name}  {scale:.2f} µm/px", lyr.name)
+        if current is not None:
+            idx = self.layer_combo.findData(current)
+            if idx >= 0:
+                self.layer_combo.setCurrentIndex(idx)
+        self.layer_combo.blockSignals(False)
 
     @property
     def op(self) -> str | None:
@@ -716,7 +737,7 @@ class _MaskRow(QWidget):
 
     @property
     def layer_name(self) -> str:
-        return self.layer_combo.currentText()
+        return self.layer_combo.currentData() or ""
 
 
 class CombineWidget(QWidget):
@@ -780,12 +801,30 @@ class CombineWidget(QWidget):
         viewer.layers.events.inserted.connect(lambda _: self._refresh_all_rows())
         viewer.layers.events.removed.connect(lambda _: self._refresh_all_rows())
 
+    def _seed_shape(self) -> tuple | None:
+        if not self._rows:
+            return None
+        name = self._rows[0].layer_name
+        if name and name in self._viewer.layers:
+            return self._viewer.layers[name].data.shape
+        return None
+
     def _add_row(self, first: bool = False):
-        row = _MaskRow(self._viewer, first=first)
+        seed_shape = None if first else self._seed_shape()
+        row = _MaskRow(self._viewer, first=first, filter_shape=seed_shape)
         if not first and hasattr(row, "_rm_btn"):
             row._rm_btn.clicked.connect(lambda: self._remove_row(row))
         self._rows.append(row)
         self._rows_layout.addWidget(row)
+        if first:
+            row.layer_combo.currentIndexChanged.connect(self._on_seed_changed)
+
+    def _on_seed_changed(self):
+        for row in self._rows[1:]:
+            self._rows_layout.removeWidget(row)
+            row.deleteLater()
+        self._rows = self._rows[:1]
+        self._add_row()
 
     def _remove_row(self, row: _MaskRow):
         if len(self._rows) <= 2:
@@ -795,8 +834,9 @@ class CombineWidget(QWidget):
         row.deleteLater()
 
     def _refresh_all_rows(self):
-        for row in self._rows:
-            row.refresh_layers()
+        seed_shape = self._seed_shape()
+        for i, row in enumerate(self._rows):
+            row.refresh_layers(filter_shape=None if i == 0 else seed_shape)
 
     def _on_compute(self):
         layer_names = [r.layer_name for r in self._rows]
