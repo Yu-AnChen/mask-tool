@@ -35,10 +35,12 @@ def _load_image(path: str, viewer: napari.Viewer) -> None:
         channel_names = [f"ch{i}" for i in range(reader.pyramid[0].shape[0])]
 
     px = reader.pixel_size
+    # Reverse channel axis so ch 0 lands on top of the layer list
+    # (napari adds layers sequentially; the last-added ends up on top)
     viewer.add_image(
-        reader.pyramid,
+        [level[::-1] for level in reader.pyramid],
         channel_axis=0,
-        name=channel_names,
+        name=channel_names[::-1],
         multiscale=True,
         visible=False,
         contrast_limits=(0, 5000),

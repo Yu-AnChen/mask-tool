@@ -332,14 +332,15 @@ class RollingBallWidget(QWidget):
         out_name = f"{name}-rb-{radius_µm:.0f}µm"
         return layer, data, radius_px, out_name
 
-    def _add_or_replace_image(self, arr, name, scale, translate):
+    def _add_or_replace_image(self, arr, name, scale, translate, **kwargs):
         if name in self._viewer.layers:
             lyr = self._viewer.layers[name]
             lyr.data = arr
             lyr.scale = scale
             lyr.translate = translate
+            # kwargs (colormap, contrast_limits) only applied on first creation
         else:
-            self._viewer.add_image(arr, name=name, scale=scale, translate=translate)
+            self._viewer.add_image(arr, name=name, scale=scale, translate=translate, **kwargs)
 
     def _on_preview(self):
         inputs = self._current_inputs()
@@ -351,6 +352,8 @@ class RollingBallWidget(QWidget):
             lazy_result, out_name,
             scale=tuple(layer.scale[-2:]),
             translate=tuple(layer.translate[-2:]),
+            colormap=layer.colormap,
+            contrast_limits=layer.contrast_limits,
         )
 
     def _on_cache(self):
@@ -361,20 +364,26 @@ class RollingBallWidget(QWidget):
         zarr_path = str(pathlib.Path(self._cache_dir) / f"{out_name}.zarr")
         scale = tuple(layer.scale[-2:])
         translate = tuple(layer.translate[-2:])
+        colormap = layer.colormap
+        contrast_limits = layer.contrast_limits
 
         self._cache_btn.setEnabled(False)
         self._preview_btn.setEnabled(False)
 
         worker = _rolling_ball_worker(data, radius_px, zarr_path,
                                       num_workers=os.cpu_count() or 1)
-        worker.returned.connect(lambda arr: self._on_cache_done(arr, out_name, scale, translate))
+        worker.returned.connect(
+            lambda arr: self._on_cache_done(arr, out_name, scale, translate,
+                                            colormap, contrast_limits)
+        )
         worker.errored.connect(self._on_worker_error)
         worker.start()
 
-    def _on_cache_done(self, arr, out_name, scale, translate):
+    def _on_cache_done(self, arr, out_name, scale, translate, colormap, contrast_limits):
         self._cache_btn.setEnabled(True)
         self._preview_btn.setEnabled(True)
-        self._add_or_replace_image(da.from_zarr(arr), out_name, scale, translate)
+        self._add_or_replace_image(da.from_zarr(arr), out_name, scale, translate,
+                                   colormap=colormap, contrast_limits=contrast_limits)
 
     def _on_worker_error(self, exc):
         self._cache_btn.setEnabled(True)
