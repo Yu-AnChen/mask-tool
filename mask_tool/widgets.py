@@ -50,6 +50,8 @@ if TYPE_CHECKING:
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
+_FIELD_H = 24  # uniform height for all form field widgets (combo, spin, line edit)
+
 
 def _separator() -> QFrame:
     line = QFrame()
@@ -77,6 +79,7 @@ def _dbl_spin(value: float, lo: float, hi: float, decimals: int,
     if step:
         w.setSingleStep(step)
     w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    w.setFixedHeight(_FIELD_H)
     return w
 
 
@@ -87,6 +90,7 @@ def _int_spin(value: int, lo: int, hi: int, suffix: str = "") -> QSpinBox:
     if suffix:
         w.setSuffix(f" {suffix}")
     w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    w.setFixedHeight(_FIELD_H)
     return w
 
 
@@ -250,6 +254,7 @@ class RollingBallWidget(QWidget):
         form = _form()
         self._layer_combo = QComboBox()
         self._layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._layer_combo.setFixedHeight(_FIELD_H)
         form.addRow("Image layer:", self._layer_combo)
 
         self._radius_spin = _dbl_spin(25.0, 1.0, 100_000.0, 1, "µm")
@@ -277,6 +282,7 @@ class RollingBallWidget(QWidget):
         cache_path_layout.setSpacing(4)
         self._cache_path_edit = QLineEdit(self._cache_dir)
         self._cache_path_edit.setReadOnly(True)
+        self._cache_path_edit.setFixedHeight(_FIELD_H)
         browse_btn = QPushButton("…")
         browse_btn.setFixedWidth(28)
         clear_btn = QPushButton("Clear")
@@ -406,6 +412,7 @@ class ThresholdWidget(QWidget):
 
         self._layer_combo = QComboBox()
         self._layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._layer_combo.setFixedHeight(_FIELD_H)
         self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
         form.addRow("Image layer:", self._layer_combo)
 
@@ -636,10 +643,12 @@ class _MaskRow(QWidget):
             self.op_combo = QComboBox()
             self.op_combo.addItems(list(COMBINE_OPS))
             self.op_combo.setFixedWidth(80)
+            self.op_combo.setFixedHeight(_FIELD_H)
             layout.addWidget(self.op_combo)
 
         self.layer_combo = QComboBox()
         self.layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.layer_combo.setFixedHeight(_FIELD_H)
         layout.addWidget(self.layer_combo)
 
         if not first:
@@ -709,6 +718,7 @@ class CombineWidget(QWidget):
 
         self._out_name = QLineEdit("mask_combined")
         self._out_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._out_name.setFixedHeight(_FIELD_H)
         form.addRow("Output name:", self._out_name)
 
         root.addLayout(form)
@@ -814,6 +824,7 @@ class ExportWidget(QWidget):
 
         self._layer_combo = QComboBox()
         self._layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._layer_combo.setFixedHeight(_FIELD_H)
         form.addRow("Mask layer:", self._layer_combo)
 
         self._px_size = _dbl_spin(10.0, 0.001, 1000.0, 3, "µm/px")
@@ -821,6 +832,7 @@ class ExportWidget(QWidget):
 
         self._format_combo = QComboBox()
         self._format_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._format_combo.setFixedHeight(_FIELD_H)
         self._format_combo.addItems(["GeoJSON", "GeoJSON (zip)", "Zarr", "TIFF"])
         self._format_combo.currentTextChanged.connect(self._on_format_changed)
         form.addRow("Format:", self._format_combo)
@@ -831,6 +843,7 @@ class ExportWidget(QWidget):
         path_layout.setContentsMargins(0, 0, 0, 0)
         path_layout.setSpacing(4)
         self._out_path = QLineEdit(str(pathlib.Path.home() / "mask.geojson"))
+        self._out_path.setFixedHeight(_FIELD_H)
         browse_btn = QPushButton("…")
         browse_btn.setFixedWidth(28)
         browse_btn.clicked.connect(self._browse_output)
