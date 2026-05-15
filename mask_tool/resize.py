@@ -71,9 +71,18 @@ def lazy_resize(
 
     x = x.rechunk({0: chunk_size, 1: chunk_size})
 
-    out_chunks = tuple(
-        tuple(round(c * scale) for c in dim) for dim in x.chunks
-    )
+    def _cumulative_chunks(in_chunks: tuple[int, ...]) -> tuple[int, ...]:
+        """
+        Compute output chunk sizes via cumulative rounding so they sum to
+        exactly round(total_input * scale), avoiding per-chunk drift.
+        """
+        out, pos = [], 0
+        for c in in_chunks:
+            out.append(round((pos + c) * scale) - round(pos * scale))
+            pos += c
+        return tuple(out)
+
+    out_chunks = tuple(_cumulative_chunks(dim) for dim in x.chunks)
 
     x_ghost = _da_overlap(
         x.astype(np.float32),

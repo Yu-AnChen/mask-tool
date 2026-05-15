@@ -101,14 +101,14 @@ class ChannelMaskWidget(Container):
         self._px_tgt = FloatSpinBox(value=10.0, min=0.1, max=1000.0,
                                     label="Target px size (µm)")
         self._bg_sub = CheckBox(value=False, label="Rolling-ball BG subtract")
-        self._rb_rad = FloatSpinBox(value=50.0, min=1.0, max=5000.0,
-                                    label="  Ball radius (px at target res)")
+        self._rb_rad = FloatSpinBox(value=500.0, min=1.0, max=100_000.0,
+                                    label="  Ball radius (µm)")
         self._sigma = FloatSlider(value=1.0, min=0.0, max=20.0, step=0.5,
                                   label="Gaussian sigma", readout=True)
         self._thresh = FloatSlider(value=400.0, min=0.0, max=65535.0, step=10.0,
                                    label="Threshold", readout=True, tracking=True)
-        self._holes = SpinBox(value=10, min=0, max=100_000, label="Fill holes ≤ (px²)")
-        self._objs = SpinBox(value=10, min=0, max=100_000, label="Remove objects < (px²)")
+        self._holes = SpinBox(value=1000, min=0, max=100_000_000, label="Fill holes ≤ (µm²)")
+        self._objs = SpinBox(value=1000, min=0, max=100_000_000, label="Remove objects < (µm²)")
         self._name = LineEdit(value="mask", label="Output layer name")
         self._btn_build = PushButton(text="Build mask")
         self._btn_apply = PushButton(text="Apply threshold (reuse cache)")
@@ -143,15 +143,18 @@ class ChannelMaskWidget(Container):
     # ── slots ──
 
     def _on_layer_changed(self, layer_name: str | None):
-        """Show/hide channel index depending on whether the layer is multichannel."""
+        """Update channel index visibility and auto-fill source pixel size from layer scale."""
         import dask.array as da
         if not layer_name or layer_name not in self._viewer.layers:
             self._channel.visible = False
             return
-        data = self._viewer.layers[layer_name].data
+        lyr = self._viewer.layers[layer_name]
+        data = lyr.data
         if not isinstance(data, (np.ndarray, da.Array)):
             data = data[0]
         self._channel.visible = data.ndim > 2
+        # pixel size is the layer scale — always in µm because launch.py sets it that way
+        self._px_src.value = round(float(lyr.scale[-1]), 6)
 
     def _on_bg_toggle(self, value):
         self._rb_rad.visible = bool(value)
@@ -159,28 +162,35 @@ class ChannelMaskWidget(Container):
     def _cache_key(self) -> str:
         return f"{self._layer.value}[ch{self._channel.value}]@{self._px_tgt.value}µm"
 
+    def _um2_to_px2(self, um2: float, px_tgt: float) -> int:
+        """Convert µm² area threshold to mask-pixel² (floor, min 1 if nonzero)."""
+        if um2 <= 0:
+            return 0
+        return max(1, int(um2 / px_tgt ** 2))
+
     def _on_build(self):
         layer_name = self._layer.value
         if not layer_name:
             return
         src = _get_layer_data_2d(self._viewer, layer_name, self._channel.value)
         params = self._current_params(layer_name)
+        px_tgt = params.target_px_size
 
         cache, mask = build_channel_mask(
             src,
             px_size_src=params.px_size_src,
-            target_px_size=params.target_px_size,
+            target_px_size=px_tgt,
             bg_subtract=params.bg_subtract,
-            rolling_ball_radius=params.rolling_ball_radius,
+            rolling_ball_radius=params.rolling_ball_radius / px_tgt,  # µm → mask px
             gaussian_sigma=params.gaussian_sigma,
             threshold=params.threshold,
-            hole_threshold=params.hole_threshold,
-            obj_threshold=params.obj_threshold,
+            hole_threshold=self._um2_to_px2(params.hole_threshold, px_tgt),
+            obj_threshold=self._um2_to_px2(params.obj_threshold, px_tgt),
         )
         key = self._cache_key()
         self._cache[key] = cache
         self._params[key] = params
-        self._push_labels(mask, params.target_px_size)
+        self._push_labels(mask)
 
     def _on_apply(self):
         """Re-threshold using the existing cache — skips the expensive resize step."""
@@ -191,19 +201,20 @@ class ChannelMaskWidget(Container):
             return
         layer_name = self._layer.value
         params = self._current_params(layer_name)
+        px_tgt = params.target_px_size
 
         _, mask = build_channel_mask(
             None,  # ignored when existing_cache is provided
             px_size_src=params.px_size_src,
-            target_px_size=params.target_px_size,
+            target_px_size=px_tgt,
             gaussian_sigma=params.gaussian_sigma,
             threshold=params.threshold,
-            hole_threshold=params.hole_threshold,
-            obj_threshold=params.obj_threshold,
+            hole_threshold=self._um2_to_px2(params.hole_threshold, px_tgt),
+            obj_threshold=self._um2_to_px2(params.obj_threshold, px_tgt),
             existing_cache=cache,
         )
         self._params[key] = params
-        self._push_labels(mask, params.target_px_size)
+        self._push_labels(mask)
 
     def _on_clear(self):
         self._cache.clear()
@@ -226,18 +237,45 @@ class ChannelMaskWidget(Container):
             obj_threshold=self._objs.value,
         )
 
-    def _push_labels(self, mask: np.ndarray, px: float):
+    def _push_labels(self, mask: np.ndarray):
+        """Add or update a Labels layer, deriving scale from the source image layer.
+
+        Scale is computed as source_world_extent / mask_pixels so that integer
+        rounding in lazy_resize doesn't cause the mask to drift from the image.
+        """
+        import dask.array as da
+
         name = self._name.value or self._cache_key()
-        scale = (px, px)
-        translate = (px * 0.5, px * 0.5)
+        layer_name = self._layer.value
+
+        src_layer = self._viewer.layers[layer_name]
+        src_data = src_layer.data
+        if not isinstance(src_data, (np.ndarray, da.Array)):
+            src_data = src_data[0]  # full-res level of MultiScaleData
+
+        # world extent of the source layer (µm)
+        src_H, src_W = src_data.shape[-2], src_data.shape[-1]
+        src_scale_y, src_scale_x = src_layer.scale[-2], src_layer.scale[-1]
+        src_tr_y, src_tr_x = src_layer.translate[-2], src_layer.translate[-1]
+
+        # actual mask pixel size that covers exactly the same extent
+        scale_y = src_H * src_scale_y / mask.shape[0]
+        scale_x = src_W * src_scale_x / mask.shape[1]
+        # align pixel-0 edge of mask to pixel-0 edge of source
+        translate_y = src_tr_y - src_scale_y / 2 + scale_y / 2
+        translate_x = src_tr_x - src_scale_x / 2 + scale_x / 2
+
         if name in self._viewer.layers:
-            self._viewer.layers[name].data = mask.astype(np.uint8)
+            lyr = self._viewer.layers[name]
+            lyr.data = mask.astype(np.uint8)
+            lyr.scale = (scale_y, scale_x)
+            lyr.translate = (translate_y, translate_x)
         else:
             self._viewer.add_labels(
                 mask.astype(np.uint8),
                 name=name,
-                scale=scale,
-                translate=translate,
+                scale=(scale_y, scale_x),
+                translate=(translate_y, translate_x),
             )
 
     def get_params(self) -> dict:
@@ -323,8 +361,8 @@ class CombineWidget(QWidget):
         root.addWidget(add_btn)
 
         root.addWidget(QLabel("Post-combine cleanup:"))
-        self._holes = SpinBox(value=0, min=0, max=100_000, label="Fill holes ≤ (px²)")
-        self._objs = SpinBox(value=0, min=0, max=100_000, label="Remove objects < (px²)")
+        self._holes = SpinBox(value=0, min=0, max=100_000_000, label="Fill holes ≤ (µm²)")
+        self._objs = SpinBox(value=0, min=0, max=100_000_000, label="Remove objects < (µm²)")
         root.addWidget(self._holes.native)
         root.addWidget(self._objs.native)
 
@@ -374,11 +412,16 @@ class CombineWidget(QWidget):
                 return
             masks.append(np.asarray(self._viewer.layers[name].data).astype(bool))
 
+        # derive pixel size from the first mask layer's scale for µm² → px² conversion
+        px = float(self._viewer.layers[layer_names[0]].scale[-1])
+        hole_px = max(1, int(self._holes.value / px ** 2)) if self._holes.value > 0 else 0
+        obj_px  = max(1, int(self._objs.value  / px ** 2)) if self._objs.value  > 0 else 0
+
         result = combine_masks(
             masks,
             ops,
-            hole_threshold=self._holes.value,
-            obj_threshold=self._objs.value,
+            hole_threshold=hole_px,
+            obj_threshold=obj_px,
         )
 
         self._last_params = CombineParams(
