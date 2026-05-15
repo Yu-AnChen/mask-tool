@@ -424,6 +424,7 @@ class ThresholdWidget(QWidget):
         viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
         viewer.layers.events.removed.connect(self._on_layer_removed)
         self._refresh_layers()
+        self._on_layer_changed(self._layer_combo.currentText())
 
     def _refresh_layers(self):
         _refresh_combo(self._layer_combo, _image_layers_no_pre(self._viewer))
