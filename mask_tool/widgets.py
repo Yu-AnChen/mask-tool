@@ -18,7 +18,7 @@ import dask.array as da
 import numpy as np
 from napari.qt import thread_worker
 from napari.utils import Colormap, progress
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -935,12 +935,18 @@ class MaskInfoWidget(QWidget):
 
         # Dynamic form — rows are rebuilt on each selection change
         self._form_widget = QWidget()
+        self._form_widget.setContentsMargins(0, 0, 0, 0)
         self._form = _form()
         self._form_widget.setLayout(self._form)
         self._form_widget.setVisible(False)
         root.addWidget(self._form_widget)
 
         viewer.layers.selection.events.changed.connect(self._on_selection_changed)
+        viewer.layers.events.inserted.connect(self._on_layer_inserted)
+
+    def _on_layer_inserted(self, _event=None):
+        # Defer so ThresholdWidget/_on_finalize can set metadata before we read it
+        QTimer.singleShot(0, self._on_selection_changed)
 
     def _on_selection_changed(self, _event=None):
         selected = list(self._viewer.layers.selection)
