@@ -421,6 +421,8 @@ class ThresholdWidget(QWidget):
         root.addLayout(form)
 
         self._sigma.valueChanged.connect(self._apply_sigma)
+        self._px_src.valueChanged.connect(self._on_px_size_changed)
+        self._px_tgt.valueChanged.connect(self._on_px_size_changed)
 
         self._invert = QCheckBox("Invert colormap  (brightfield)")
         self._invert.stateChanged.connect(self._on_invert_changed)
@@ -546,6 +548,11 @@ class ThresholdWidget(QWidget):
             )
 
         self._subscribe_preview(pre_layer)
+
+    def _on_px_size_changed(self):
+        """Re-downsample when px size changes, if a preview layer exists."""
+        if self._preview_raw is not None and self._add_preview_btn.isEnabled():
+            self._on_add_preview()
 
     def _apply_sigma(self):
         """Re-blur the stored raw downsample when sigma changes."""
