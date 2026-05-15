@@ -189,13 +189,10 @@ def _rolling_ball_worker(data, radius_px: float, zarr_path: str, num_workers: in
 
 
 @thread_worker
-def _downsample_worker(src_data, scale: float, sigma: float):
+def _downsample_worker(src_data, scale: float):
     if not isinstance(src_data, da.Array):
         src_data = da.from_array(src_data)
-    img = lazy_resize(src_data, scale=scale).compute()
-    if sigma > 0:
-        img = cv2.GaussianBlur(img, ksize=None, sigmaX=float(sigma), sigmaY=float(sigma))
-    return img
+    return lazy_resize(src_data, scale=scale).compute()
 
 
 # ── RollingBallWidget ─────────────────────────────────────────────────────────
@@ -364,7 +361,8 @@ class ThresholdWidget(QWidget):
         super().__init__(parent)
         self._viewer = viewer
         self._preview_layer: "napari.layers.Image | None" = None
-        self._preview_data: np.ndarray | None = None
+        self._preview_raw: np.ndarray | None = None   # downsampled, no blur
+        self._preview_data: np.ndarray | None = None  # blurred, used for threshold
         self._src_layer_name: str | None = None
         self._params_log: dict[str, dict] = {}
 
@@ -391,6 +389,8 @@ class ThresholdWidget(QWidget):
         form.addRow("Gaussian sigma:", self._sigma)
 
         root.addLayout(form)
+
+        self._sigma.valueChanged.connect(self._apply_sigma)
 
         self._invert = QCheckBox("Invert colormap  (brightfield)")
         self._invert.stateChanged.connect(self._on_invert_changed)
@@ -440,6 +440,7 @@ class ThresholdWidget(QWidget):
             except Exception:
                 pass
             self._preview_layer = None
+            self._preview_raw = None
             self._preview_data = None
             self._thresh_label.setText("Threshold: —")
         self._refresh_layers()
@@ -478,13 +479,16 @@ class ThresholdWidget(QWidget):
         self._src_layer_name = src_name
         self._add_preview_btn.setEnabled(False)
 
-        worker = _downsample_worker(src_data, scale, self._sigma.value())
+        worker = _downsample_worker(src_data, scale)
         worker.returned.connect(lambda img: self._on_preview_done(img, src_layer))
         worker.errored.connect(self._on_preview_error)
         worker.start()
 
-    def _on_preview_done(self, img: np.ndarray, src_layer: "napari.layers.Image"):
+    def _on_preview_done(self, raw: np.ndarray, src_layer: "napari.layers.Image"):
         self._add_preview_btn.setEnabled(True)
+        self._preview_raw = raw
+        sigma = self._sigma.value()
+        img = cv2.GaussianBlur(raw, ksize=None, sigmaX=float(sigma), sigmaY=float(sigma)) if sigma > 0 else raw.copy()
         self._preview_data = img
 
         mask_scale, mask_translate = _compute_mask_transform(src_layer, img.shape)
@@ -499,15 +503,28 @@ class ThresholdWidget(QWidget):
             lyr.scale = mask_scale
             lyr.translate = mask_translate
             lyr.contrast_limits = clim
+            lyr.blending = "additive"
+            lyr.opacity = 0.5
             pre_layer = lyr
         else:
             pre_layer = self._viewer.add_image(
                 img, name=pre_name, colormap=cmap,
                 scale=mask_scale, translate=mask_translate,
                 contrast_limits=clim,
+                blending="additive",
+                opacity=0.5,
             )
 
         self._subscribe_preview(pre_layer)
+
+    def _apply_sigma(self):
+        """Re-blur the stored raw downsample when sigma changes."""
+        if self._preview_raw is None or self._preview_layer is None:
+            return
+        sigma = self._sigma.value()
+        img = cv2.GaussianBlur(self._preview_raw, ksize=None, sigmaX=float(sigma), sigmaY=float(sigma)) if sigma > 0 else self._preview_raw.copy()
+        self._preview_data = img
+        self._preview_layer.data = img
 
     def _on_preview_error(self, exc):
         self._add_preview_btn.setEnabled(True)
