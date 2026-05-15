@@ -36,7 +36,6 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from superqt import QCollapsible
 
 from .export import export_geojson, export_tiff, export_zarr, save_params
 from .pipeline import COMBINE_OPS, CombineParams, combine_masks, remove_small_holes, remove_small_objects
@@ -59,6 +58,14 @@ def _separator() -> QFrame:
     return line
 
 
+def _form() -> QFormLayout:
+    f = QFormLayout()
+    f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+    f.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+    f.setSpacing(5)
+    return f
+
+
 def _dbl_spin(value: float, lo: float, hi: float, decimals: int,
               suffix: str = "", step: float = 0.0) -> QDoubleSpinBox:
     w = QDoubleSpinBox()
@@ -69,7 +76,7 @@ def _dbl_spin(value: float, lo: float, hi: float, decimals: int,
         w.setSuffix(f" {suffix}")
     if step:
         w.setSingleStep(step)
-    w.setMinimumWidth(110)
+    w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     return w
 
 
@@ -79,7 +86,7 @@ def _int_spin(value: int, lo: int, hi: int, suffix: str = "") -> QSpinBox:
     w.setValue(value)
     if suffix:
         w.setSuffix(f" {suffix}")
-    w.setMinimumWidth(110)
+    w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     return w
 
 
@@ -212,15 +219,15 @@ class RollingBallWidget(QWidget):
         root.setSpacing(6)
         root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # ── layer selector ──
-        form_top = QFormLayout()
-        form_top.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        # ── parameters ──
+        form = _form()
         self._layer_combo = QComboBox()
-        form_top.addRow("Image layer:", self._layer_combo)
+        self._layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        form.addRow("Image layer:", self._layer_combo)
 
         self._radius_spin = _dbl_spin(25.0, 1.0, 100_000.0, 1, "µm")
-        form_top.addRow("Ball radius:", self._radius_spin)
-        root.addLayout(form_top)
+        form.addRow("Ball radius:", self._radius_spin)
+        root.addLayout(form)
 
         root.addWidget(_separator())
 
@@ -235,29 +242,23 @@ class RollingBallWidget(QWidget):
 
         root.addWidget(_separator())
 
-        # ── collapsible cache settings ──
-        collapsible = QCollapsible("Cache settings", self)
-        inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
-        inner_layout.setContentsMargins(4, 4, 4, 4)
-        inner_layout.setSpacing(4)
-
-        self._cache_dir_label = QLabel(self._cache_dir)
-        self._cache_dir_label.setWordWrap(True)
-        self._cache_dir_label.setStyleSheet("color: gray; font-size: 11px;")
-        inner_layout.addWidget(QLabel("Cache directory:"))
-        inner_layout.addWidget(self._cache_dir_label)
-
-        btn_row2 = QHBoxLayout()
-        btn_row2.setSpacing(6)
-        browse_btn = QPushButton("Browse…")
-        clear_btn = QPushButton("Clear cache")
-        btn_row2.addWidget(browse_btn)
-        btn_row2.addWidget(clear_btn)
-        inner_layout.addLayout(btn_row2)
-
-        collapsible.addWidget(inner)
-        root.addWidget(collapsible)
+        # ── cache dir row (always visible) ──
+        cache_form = _form()
+        cache_path_widget = QWidget()
+        cache_path_layout = QHBoxLayout(cache_path_widget)
+        cache_path_layout.setContentsMargins(0, 0, 0, 0)
+        cache_path_layout.setSpacing(4)
+        self._cache_path_edit = QLineEdit(self._cache_dir)
+        self._cache_path_edit.setReadOnly(True)
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(28)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(46)
+        cache_path_layout.addWidget(self._cache_path_edit)
+        cache_path_layout.addWidget(browse_btn)
+        cache_path_layout.addWidget(clear_btn)
+        cache_form.addRow("Cache dir:", cache_path_widget)
+        root.addLayout(cache_form)
 
         self._preview_btn.clicked.connect(self._on_preview)
         self._cache_btn.clicked.connect(self._on_cache)
@@ -339,7 +340,7 @@ class RollingBallWidget(QWidget):
         d = QFileDialog.getExistingDirectory(self, "Select cache directory", self._cache_dir)
         if d:
             self._cache_dir = d
-            self._cache_dir_label.setText(d)
+            self._cache_path_edit.setText(d)
 
     def _clear_cache(self):
         import shutil
@@ -373,11 +374,10 @@ class ThresholdWidget(QWidget):
         root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         # ── parameters ──
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setSpacing(5)
+        form = _form()
 
         self._layer_combo = QComboBox()
+        self._layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
         form.addRow("Image layer:", self._layer_combo)
 
@@ -407,9 +407,7 @@ class ThresholdWidget(QWidget):
         root.addWidget(self._thresh_label)
 
         # ── cleanup parameters ──
-        form2 = QFormLayout()
-        form2.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form2.setSpacing(5)
+        form2 = _form()
 
         self._holes = _int_spin(1000, 0, 1_000_000_000, "µm²")
         form2.addRow("Fill holes ≤:", self._holes)
@@ -643,9 +641,7 @@ class CombineWidget(QWidget):
 
         root.addWidget(_section_label("Post-combine cleanup:"))
 
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setSpacing(5)
+        form = _form()
 
         self._holes = _int_spin(0, 0, 1_000_000_000, "µm²")
         form.addRow("Fill holes ≤:", self._holes)
@@ -654,6 +650,7 @@ class CombineWidget(QWidget):
         form.addRow("Remove objects <:", self._objs)
 
         self._out_name = QLineEdit("mask_combined")
+        self._out_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         form.addRow("Output name:", self._out_name)
 
         root.addLayout(form)
@@ -747,17 +744,17 @@ class ExportWidget(QWidget):
         root.setSpacing(6)
         root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.setSpacing(5)
+        form = _form()
 
         self._layer_combo = QComboBox()
+        self._layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         form.addRow("Mask layer:", self._layer_combo)
 
         self._px_size = _dbl_spin(10.0, 0.001, 1000.0, 3, "µm/px")
         form.addRow("Pixel size:", self._px_size)
 
         self._format_combo = QComboBox()
+        self._format_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._format_combo.addItems(["GeoJSON", "GeoJSON (zip)", "Zarr", "TIFF"])
         self._format_combo.currentTextChanged.connect(self._on_format_changed)
         form.addRow("Format:", self._format_combo)
