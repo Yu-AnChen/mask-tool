@@ -491,7 +491,7 @@ class ThresholdWidget(QWidget):
         self._holes = _int_spin(1000, 0, 1_000_000_000, "µm²")
         form2.addRow("Fill holes ≤:", self._holes)
 
-        self._objs = _int_spin(1000, 0, 1_000_000_000, "µm²")
+        self._objs = _int_spin(0, 0, 1_000_000_000, "µm²")
         form2.addRow("Remove objects <:", self._objs)
 
         root.addLayout(form2)
