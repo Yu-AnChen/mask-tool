@@ -13,6 +13,7 @@ into RAM until a mask is built.
 
 from __future__ import annotations
 
+import pathlib
 import signal
 import sys
 import argparse
@@ -44,6 +45,9 @@ def _load_image(path: str, viewer: napari.Viewer) -> None:
         scale=(px, px),
         translate=(px * 0.5, px * 0.5),
     )
+    viewer.title = pathlib.Path(path).stem
+    viewer.scale_bar.visible = True
+    viewer.scale_bar.unit = "um"
     print(f"Loaded {path}")
     print(f"  pixel size : {px} µm")
     print(f"  channels   : {channel_names}")
