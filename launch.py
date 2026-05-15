@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> None:
     viewer.window.add_dock_widget(exp_widget,  area="right", name="Export")
     viewer.window.add_dock_widget(info_widget, area="right", name="Mask info")
 
+    if args.image:
+        print(f"  cache dir  : {rb_widget._cache_dir}")
+
     # Qt's C++ event loop doesn't deliver Python signals unless the interpreter
     # gets control periodically; the no-op timer wakes it every 200 ms so
     # Ctrl+C reaches the handler and viewer.close() can clean up normally.
