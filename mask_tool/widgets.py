@@ -17,7 +17,7 @@ import cv2
 import dask.array as da
 import numpy as np
 from napari.qt import thread_worker
-from napari.utils import Colormap, progress
+from napari.utils import Colormap
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -218,9 +218,8 @@ def _threshold_colormap(invert: bool = False) -> Colormap:
 
 @thread_worker
 def _rolling_ball_worker(data, radius_px: float, zarr_path: str, num_workers: int):
-    with progress(total=0, desc="Rolling ball BG subtraction"):
-        return subtract_background(data, radius=radius_px, out_path=zarr_path,
-                                   num_workers=num_workers)
+    return subtract_background(data, radius=radius_px, out_path=zarr_path,
+                               num_workers=num_workers)
 
 
 @thread_worker
