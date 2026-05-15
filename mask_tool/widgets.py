@@ -534,7 +534,7 @@ class ThresholdWidget(QWidget):
             lyr.colormap = cmap
             lyr.scale = mask_scale
             lyr.translate = mask_translate
-            lyr.contrast_limits = clim
+            # contrast_limits not reset — preserves the user's threshold
             lyr.blending = "additive"
             lyr.opacity = 0.5
             pre_layer = lyr
