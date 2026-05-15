@@ -5,7 +5,9 @@ Usage
 -----
   pixi run python launch.py
   pixi run python launch.py path/to/image.ome.tiff
-  pixi run python launch.py path/to/image.ome.tiff --channel 10 --px-size 0.325
+  pixi run python launch.py path/to/image.ome.tiff --channels 0 2 5
+  pixi run python launch.py path/to/image.ome.tiff --channel-names DAPI CD31 aSMA
+  pixi run python launch.py path/to/image.ome.tiff --channels 0 2 5 --channel-names DAPI CD31 aSMA
 
 The image is loaded as a multiscale dask array via palom so no data is read
 into RAM until a mask is built.
@@ -21,24 +23,56 @@ import argparse
 import napari
 
 
-def _load_image(path: str, viewer: napari.Viewer) -> None:
+def _load_image(
+    path: str,
+    viewer: napari.Viewer,
+    channels: list[int] | None = None,
+    channel_names_override: list[str] | None = None,
+) -> None:
     import palom.reader
     import ome_types
 
     reader = palom.reader.OmePyramidReader(path)
+    n_ch = reader.pyramid[0].shape[0]
+
     try:
         channel_names = [
             cc.name
             for cc in ome_types.from_tiff(path).images[0].pixels.channels
         ]
     except Exception:
-        channel_names = [f"ch{i}" for i in range(reader.pyramid[0].shape[0])]
+        channel_names = [f"ch{i}" for i in range(n_ch)]
+
+    # validate + apply --channels
+    if channels is not None:
+        out_of_range = [i for i in channels if i < 0 or i >= n_ch]
+        if out_of_range:
+            sys.exit(
+                f"Error: --channels indices {out_of_range} are out of range "
+                f"(image has {n_ch} channels, valid indices: 0–{n_ch - 1})"
+            )
+        pyramid = [level[channels] for level in reader.pyramid]
+        channel_names = [channel_names[i] for i in channels]
+    else:
+        pyramid = reader.pyramid
+
+    # validate + apply --channel-names
+    if channel_names_override is not None:
+        # when --channels is absent the override must cover all channels
+        expected = len(channels) if channels is not None else n_ch
+        if len(channel_names_override) != expected:
+            sys.exit(
+                f"Error: --channel-names has {len(channel_names_override)} "
+                f"name(s) but {'selected' if channels is not None else 'image'} "
+                f"has {expected} channel(s)"
+            )
+        channel_names = channel_names_override
 
     px = reader.pixel_size
     # Reverse channel axis so ch 0 lands on top of the layer list
     # (napari adds layers sequentially; the last-added ends up on top)
     viewer.add_image(
-        [level[::-1] for level in reader.pyramid],
+        [level[::-1] for level in pyramid],
         channel_axis=0,
         name=channel_names[::-1],
         multiscale=True,
@@ -59,12 +93,31 @@ def _load_image(path: str, viewer: napari.Viewer) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="napari mask builder")
     parser.add_argument("image", nargs="?", help="Path to OME-TIFF")
+    parser.add_argument(
+        "--channels", nargs="+", type=int, metavar="IDX",
+        help="Zero-based channel indices to load (default: all)",
+    )
+    parser.add_argument(
+        "--channel-names", nargs="+", metavar="NAME",
+        help="Channel names; must match --channels count (or total channels if --channels omitted)",
+    )
     args = parser.parse_args(argv)
+
+    if args.channels is not None and args.channel_names is not None:
+        if len(args.channels) != len(args.channel_names):
+            parser.error(
+                f"--channels ({len(args.channels)}) and --channel-names "
+                f"({len(args.channel_names)}) must have the same length"
+            )
 
     viewer = napari.Viewer(title="Mask Builder")
 
     if args.image:
-        _load_image(args.image, viewer)
+        _load_image(
+            args.image, viewer,
+            channels=args.channels,
+            channel_names_override=args.channel_names,
+        )
 
     # build and attach widgets
     from mask_tool.widgets import RollingBallWidget, ThresholdWidget, CombineWidget, ExportWidget, MaskInfoWidget
