@@ -17,7 +17,6 @@ import sys
 import argparse
 
 import napari
-import numpy as np
 
 
 def _load_image(path: str, viewer: napari.Viewer) -> None:

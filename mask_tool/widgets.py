@@ -9,7 +9,6 @@ Three panels:
 
 from __future__ import annotations
 
-import json
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -22,7 +21,6 @@ from magicgui.widgets import (
     FileEdit,
     FloatSlider,
     FloatSpinBox,
-    Label,
     LineEdit,
     PushButton,
     SpinBox,
@@ -49,6 +47,7 @@ from .pipeline import (
 )
 
 if TYPE_CHECKING:
+    import dask.array as da
     import napari
 
 
