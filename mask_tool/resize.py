@@ -23,7 +23,7 @@ def _resize_block(
     block_info=None,
 ) -> np.ndarray:
     resized = cv2.resize(
-        block.astype(np.float32),
+        block,
         dsize=None,
         fx=scale,
         fy=scale,
@@ -61,7 +61,7 @@ def lazy_resize(
     chunk_size : source-space chunk edge in pixels
     """
     if abs(scale - 1.0) < 1e-9:
-        return x.astype(np.float32)
+        return x
 
     if x.ndim != 2:
         raise ValueError(f"lazy_resize expects a 2-D array, got shape {x.shape}")
@@ -84,8 +84,9 @@ def lazy_resize(
 
     out_chunks = tuple(_cumulative_chunks(dim) for dim in x.chunks)
 
+    src_dtype = x.dtype
     x_ghost = _da_overlap(
-        x.astype(np.float32),
+        x,
         depth={0: depth_in, 1: depth_in},
         boundary="reflect",
     )
@@ -93,4 +94,4 @@ def lazy_resize(
     def _block(block, block_info=None):
         return _resize_block(block, scale=scale, depth_out=depth_out, block_info=block_info)
 
-    return da.map_blocks(_block, x_ghost, chunks=out_chunks, dtype=np.float32)
+    return da.map_blocks(_block, x_ghost, chunks=out_chunks, dtype=src_dtype)
