@@ -508,7 +508,10 @@ class ThresholdWidget(QWidget):
     def _on_contrast_changed(self):
         if self._preview_layer is not None:
             val = self._preview_layer.contrast_limits[0]
-            self._thresh_label.setText(f"{val:.1f}")
+            if self._preview_data is not None and np.issubdtype(self._preview_data.dtype, np.integer):
+                self._thresh_label.setText(str(int(val)))
+            else:
+                self._thresh_label.setText(f"{val:.1f}")
 
     def _on_invert_changed(self):
         if self._preview_layer is not None:
