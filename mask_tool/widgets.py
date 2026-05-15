@@ -95,8 +95,11 @@ class ChannelMaskWidget(Container):
     def __init__(self, viewer: "napari.Viewer"):
         self._viewer = viewer
 
-        # widgets
-        self._layer = ComboBox(choices=[], label="Image layer")
+        # widgets — layer ComboBox uses a callable so reset_choices() refreshes it
+        self._layer = ComboBox(
+            choices=lambda _w: _image_layers(viewer),
+            label="Image layer",
+        )
         self._channel = SpinBox(value=0, min=0, max=999, label="Channel index")
         self._px_src = FloatSpinBox(value=0.325, min=0.001, max=100.0, step=0.001,
                                     label="Source px size (µm)")
@@ -131,23 +134,29 @@ class ChannelMaskWidget(Container):
         self._params: dict[str, ChannelMaskParams] = {}
 
         self._bg_sub.changed.connect(self._on_bg_toggle)
+        self._layer.changed.connect(self._on_layer_changed)
         self._btn_build.changed.connect(self._on_build)
         self._btn_apply.changed.connect(self._on_apply)
         self._btn_clear.changed.connect(self._on_clear)
 
-        self._refresh_layers()
-        viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
-        viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
+        viewer.layers.events.inserted.connect(lambda _: self._layer.reset_choices())
+        viewer.layers.events.removed.connect(lambda _: self._layer.reset_choices())
 
         self._on_bg_toggle(False)
+        self._on_layer_changed(self._layer.value)
 
     # ── slots ──
 
-    def _refresh_layers(self):
-        choices = _image_layers(self._viewer)
-        self._layer.choices = choices
-        if choices:
-            self._layer.value = choices[0]
+    def _on_layer_changed(self, layer_name: str | None):
+        """Show/hide channel index depending on whether the layer is multichannel."""
+        if not layer_name or layer_name not in self._viewer.layers:
+            self._channel.visible = False
+            return
+        data = self._viewer.layers[layer_name].data
+        if isinstance(data, list):
+            data = data[0]
+        ndim = data.ndim if hasattr(data, "ndim") else len(np.shape(data))
+        self._channel.visible = ndim > 2
 
     def _on_bg_toggle(self, value):
         self._rb_rad.visible = bool(value)
@@ -417,7 +426,10 @@ class ExportWidget(Container):
         self._channel_widget = channel_widget
         self._combine_widget = combine_widget
 
-        self._layer = ComboBox(choices=[], label="Mask layer")
+        self._layer = ComboBox(
+            choices=lambda _w: _labels_layers(viewer),
+            label="Mask layer",
+        )
         self._px_size = FloatSpinBox(value=10.0, min=0.001, max=1000.0,
                                      label="Pixel size (µm)")
         self._format = ComboBox(
@@ -436,15 +448,8 @@ class ExportWidget(Container):
         ])
 
         self._btn_export.changed.connect(self._on_export)
-        self._refresh_layers()
-        viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
-        viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
-
-    def _refresh_layers(self):
-        choices = _labels_layers(self._viewer)
-        self._layer.choices = choices
-        if choices:
-            self._layer.value = choices[0]
+        viewer.layers.events.inserted.connect(lambda _: self._layer.reset_choices())
+        viewer.layers.events.removed.connect(lambda _: self._layer.reset_choices())
 
     def _on_export(self):
         layer_name = self._layer.value
