@@ -152,6 +152,22 @@ def _labels_layers(viewer: "napari.Viewer") -> list[str]:
     return [lyr.name for lyr in reversed(viewer.layers) if isinstance(lyr, napari.layers.Labels)]
 
 
+def _next_label(viewer: "napari.Viewer") -> int:
+    """Return the smallest positive label value not already used by any Labels layer."""
+    import napari.layers
+    used = {
+        int(v)
+        for lyr in viewer.layers
+        if isinstance(lyr, napari.layers.Labels)
+        for v in [lyr.data.max()]
+        if v > 0
+    }
+    v = 1
+    while v in used:
+        v += 1
+    return v
+
+
 def _refresh_combo(combo: QComboBox, choices: list[str]) -> None:
     current = combo.currentText()
     combo.blockSignals(True)
@@ -628,7 +644,7 @@ class ThresholdWidget(QWidget):
         mask_scale, mask_translate = _compute_mask_transform(src_layer, mask.shape)
         fin_name = _fin_name(self._src_layer_name)
         fin_layer = self._viewer.add_labels(
-            mask.astype(np.uint8), name=fin_name,
+            mask.astype(np.uint8) * _next_label(self._viewer), name=fin_name,
             scale=mask_scale, translate=mask_translate,
         )
 
@@ -815,11 +831,12 @@ class CombineWidget(QWidget):
         name = self._out_name.text().strip() or "mask_combined"
         if name in self._viewer.layers:
             out_layer = self._viewer.layers[name]
-            out_layer.data = result.astype(np.uint8)
+            label_val = int(out_layer.data.max()) or 1
+            out_layer.data = result.astype(np.uint8) * label_val
         else:
             ref = self._viewer.layers[layer_names[0]]
             out_layer = self._viewer.add_labels(
-                result.astype(np.uint8), name=name,
+                result.astype(np.uint8) * _next_label(self._viewer), name=name,
                 scale=ref.scale, translate=ref.translate,
             )
         out_layer.metadata["mask_params"] = mask_params
