@@ -647,7 +647,7 @@ class _MaskRow(QWidget):
         layout.setSpacing(4)
 
         if first:
-            lbl = QLabel("seed")
+            lbl = QLabel("Mask 1")
             lbl.setFixedWidth(60)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(lbl)
@@ -712,7 +712,7 @@ class CombineWidget(QWidget):
         scroll.setWidget(self._rows_container)
         root.addWidget(scroll)
 
-        add_btn = QPushButton("+ Add layer")
+        add_btn = QPushButton("+ Add mask")
         add_btn.clicked.connect(self._add_row)
         root.addWidget(add_btn)
 
