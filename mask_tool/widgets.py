@@ -1,62 +1,78 @@
 """
-napari dock widgets for the mask-building pipeline.
+napari dock widgets for the mask-building tool.
 
-Three panels:
-  ChannelMaskWidget  — load channel, resize, BG-subtract, threshold → Labels layer
-  CombineWidget      — combine 2+ mask layers with logical ops → Labels layer
-  ExportWidget       — export final mask to GeoJSON / Zarr / TIFF + save params
+RollingBallWidget  – BG subtraction at source resolution (lazy preview or cached)
+ThresholdWidget    – downsample → gaussian → live threshold → finalize mask
+CombineWidget      – logical ops on 2+ label layers
+ExportWidget       – GeoJSON / Zarr / TIFF export with params log
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
-from typing import TYPE_CHECKING
+import tempfile
 
+import cv2
+import dask.array as da
 import numpy as np
-import zarr
 from magicgui.widgets import (
-    CheckBox,
     ComboBox,
     Container,
     FileEdit,
-    FloatSlider,
     FloatSpinBox,
     LineEdit,
     PushButton,
     SpinBox,
 )
+from napari.qt import thread_worker
+from napari.utils import Colormap, progress
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+from superqt import QCollapsible
 
 from .export import export_geojson, export_tiff, export_zarr, save_params
-from .pipeline import (
-    COMBINE_OPS,
-    ChannelMaskParams,
-    CombineParams,
-    build_channel_mask,
-    combine_masks,
-)
+from .pipeline import COMBINE_OPS, CombineParams, combine_masks, remove_small_holes, remove_small_objects
+from .resize import lazy_resize
+from .rolling_ball import subtract_background, subtract_background_lazy
 
+from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    import dask.array as da
     import napari
+    import napari.layers
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── module-level helpers ──────────────────────────────────────────────────────
 
 
 def _image_layers(viewer: "napari.Viewer") -> list[str]:
     import napari.layers
-    return [lyr.name for lyr in viewer.layers if isinstance(lyr, napari.layers.Image)]
+    return [
+        lyr.name for lyr in viewer.layers
+        if isinstance(lyr, napari.layers.Image)
+    ]
+
+
+def _image_layers_no_pre(viewer: "napari.Viewer") -> list[str]:
+    """Image layers excluding pre-{name} preview layers."""
+    import napari.layers
+    return [
+        lyr.name for lyr in viewer.layers
+        if isinstance(lyr, napari.layers.Image) and not lyr.name.startswith("pre-")
+    ]
 
 
 def _labels_layers(viewer: "napari.Viewer") -> list[str]:
@@ -64,225 +80,507 @@ def _labels_layers(viewer: "napari.Viewer") -> list[str]:
     return [lyr.name for lyr in viewer.layers if isinstance(lyr, napari.layers.Labels)]
 
 
-def _get_layer_data_2d(viewer: "napari.Viewer", name: str, channel_idx: int) -> "np.ndarray | da.Array":
-    """Extract a single 2-D plane from a napari Image layer."""
-    import dask.array as da
-    lyr = viewer.layers[name]
-    data = lyr.data
-    # multiscale: MultiScaleData, list, or any non-array sequence — take level 0 (full res)
+def _get_layer_data_2d(layer: "napari.layers.Image") -> "np.ndarray | da.Array":
+    """Return the 2-D data array from an Image layer (handles multiscale)."""
+    data = layer.data
+    if not isinstance(data, (np.ndarray, da.Array)):
+        data = data[0]  # multiscale: take full-res level
+    if data.ndim != 2:
+        raise ValueError(f"Layer {layer.name!r} is not 2-D (shape={data.shape})")
+    return data
+
+
+def _compute_mask_transform(
+    src_layer: "napari.layers.Image", mask_shape: tuple[int, int]
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Derive napari scale and translate for a mask from its source image layer.
+
+    Uses world-extent / mask_pixels so the mask aligns precisely regardless of
+    per-chunk rounding in lazy_resize.
+    """
+    data = src_layer.data
     if not isinstance(data, (np.ndarray, da.Array)):
         data = data[0]
-    if data.ndim == 2:
-        return data
-    if data.ndim == 3:
-        return data[channel_idx]
-    raise ValueError(
-        f"Layer {name!r} has data ndim={data.ndim}; expected 2 or 3 (C, H, W)."
-    )
+    src_H, src_W = data.shape[-2], data.shape[-1]
+    sy, sx = float(src_layer.scale[-2]), float(src_layer.scale[-1])
+    ty, tx = float(src_layer.translate[-2]), float(src_layer.translate[-1])
+    scale_y = src_H * sy / mask_shape[0]
+    scale_x = src_W * sx / mask_shape[1]
+    tr_y = ty - sy / 2 + scale_y / 2
+    tr_x = tx - sx / 2 + scale_x / 2
+    return (scale_y, scale_x), (tr_y, tr_x)
 
 
-# ── Channel mask widget ───────────────────────────────────────────────────────
+def _strip_mask_prefix(name: str) -> str:
+    for prefix in ("pre-", "fin-"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
 
 
-class ChannelMaskWidget(Container):
-    """Build a threshold-based binary mask from one channel of an image layer."""
+def _pre_name(src_name: str) -> str:
+    return f"pre-{_strip_mask_prefix(src_name)}"
 
-    def __init__(self, viewer: "napari.Viewer"):
+
+def _fin_name(src_name: str) -> str:
+    return f"fin-{_strip_mask_prefix(src_name)}"
+
+
+def _threshold_colormap(invert: bool = False) -> Colormap:
+    """Binary-looking colormap: below contrast_limits[0] = black, above = white."""
+    if invert:
+        return Colormap(["black", "black"], name="threshold_inv",
+                        low_color="white", high_color="black")
+    return Colormap(["white", "white"], name="threshold",
+                    low_color="black", high_color="white")
+
+
+# ── background thread workers ────────────────────────────────────────────────
+
+
+@thread_worker
+def _rolling_ball_worker(
+    data: "np.ndarray | da.Array",
+    radius_px: float,
+    zarr_path: str,
+    num_workers: int,
+):
+    with progress(total=0, desc="Rolling ball BG subtraction"):
+        return subtract_background(data, radius=radius_px, out_path=zarr_path,
+                                   num_workers=num_workers)
+
+
+@thread_worker
+def _downsample_worker(
+    src_data: "np.ndarray | da.Array",
+    scale: float,
+    sigma: float,
+):
+    if not isinstance(src_data, da.Array):
+        src_data = da.from_array(src_data)
+    img = lazy_resize(src_data, scale=scale).compute()
+    if sigma > 0:
+        img = cv2.GaussianBlur(img, ksize=None, sigmaX=float(sigma), sigmaY=float(sigma))
+    return img
+
+
+# ── RollingBallWidget ─────────────────────────────────────────────────────────
+
+
+class RollingBallWidget(QWidget):
+    """BG subtraction at source resolution.
+
+    Preview: lazy dask layer, immediate.
+    Cache: computed to zarr in a background thread with progress bar.
+    Output layer name: {source}-rb-{radius}µm
+    """
+
+    def __init__(self, viewer: "napari.Viewer", parent=None):
+        super().__init__(parent)
         self._viewer = viewer
+        self._cache_dir = tempfile.mkdtemp(prefix="masktool_rb_")
 
-        # widgets — layer ComboBox uses a callable so reset_choices() refreshes it
-        self._layer = ComboBox(
-            choices=lambda _w: _image_layers(viewer),
-            label="Image layer",
-        )
-        self._channel = SpinBox(value=0, min=0, max=999, label="Channel index")
-        self._px_src = FloatSpinBox(value=0.325, min=0.001, max=100.0, step=0.001,
-                                    label="Source px size (µm)")
-        self._px_tgt = FloatSpinBox(value=10.0, min=0.1, max=1000.0,
-                                    label="Target px size (µm)")
-        self._bg_sub = CheckBox(value=False, label="Rolling-ball BG subtract")
-        self._rb_rad = FloatSpinBox(value=500.0, min=1.0, max=100_000.0,
-                                    label="  Ball radius (µm)")
-        self._sigma = FloatSlider(value=1.0, min=0.0, max=20.0, step=0.5,
-                                  label="Gaussian sigma", readout=True)
-        self._thresh = FloatSlider(value=400.0, min=0.0, max=65535.0, step=10.0,
-                                   label="Threshold", readout=True, tracking=True)
-        self._holes = SpinBox(value=1000, min=0, max=100_000_000, label="Fill holes ≤ (µm²)")
-        self._objs = SpinBox(value=1000, min=0, max=100_000_000, label="Remove objects < (µm²)")
-        self._name = LineEdit(value="mask", label="Output layer name")
-        self._btn_build = PushButton(text="Build mask")
-        self._btn_apply = PushButton(text="Apply threshold (reuse cache)")
-        self._btn_clear = PushButton(text="Clear cache")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setAlignment(Qt.AlignTop)
 
-        super().__init__(widgets=[
-            self._layer, self._channel, self._px_src, self._px_tgt,
-            self._bg_sub, self._rb_rad,
-            self._sigma, self._thresh,
-            self._holes, self._objs,
-            self._name,
-            self._btn_build, self._btn_apply, self._btn_clear,
-        ])
+        layout.addWidget(QLabel("Image layer:"))
+        self._layer_combo = QComboBox()
+        layout.addWidget(self._layer_combo)
 
-        # cache: {cache_key: zarr.Array}
-        self._cache: dict[str, zarr.Array] = {}
-        # params log: {cache_key: ChannelMaskParams}
-        self._params: dict[str, ChannelMaskParams] = {}
+        form = QFormLayout()
+        self._radius_spin = QDoubleSpinBox()
+        self._radius_spin.setRange(1.0, 100_000.0)
+        self._radius_spin.setValue(25.0)
+        self._radius_spin.setDecimals(1)
+        self._radius_spin.setSuffix(" µm")
+        form.addRow("Ball radius:", self._radius_spin)
+        layout.addLayout(form)
 
-        self._bg_sub.changed.connect(self._on_bg_toggle)
-        self._layer.changed.connect(self._on_layer_changed)
-        self._btn_build.changed.connect(self._on_build)
-        self._btn_apply.changed.connect(self._on_apply)
-        self._btn_clear.changed.connect(self._on_clear)
+        btn_row = QHBoxLayout()
+        self._preview_btn = QPushButton("Preview")
+        self._cache_btn = QPushButton("Cache")
+        btn_row.addWidget(self._preview_btn)
+        btn_row.addWidget(self._cache_btn)
+        layout.addLayout(btn_row)
 
-        viewer.layers.events.inserted.connect(lambda _: self._layer.reset_choices())
-        viewer.layers.events.removed.connect(lambda _: self._layer.reset_choices())
+        # ── collapsible cache settings ──
+        collapsible = QCollapsible("Cache settings", self)
+        cache_inner = QWidget()
+        cache_layout = QVBoxLayout(cache_inner)
+        cache_layout.setContentsMargins(4, 4, 4, 4)
 
-        self._on_bg_toggle(False)
-        self._on_layer_changed(self._layer.value)
+        self._cache_dir_label = QLabel(self._cache_dir)
+        self._cache_dir_label.setWordWrap(True)
+        cache_layout.addWidget(QLabel("Cache directory:"))
+        cache_layout.addWidget(self._cache_dir_label)
 
-    # ── slots ──
+        dir_row = QHBoxLayout()
+        browse_btn = QPushButton("Browse…")
+        clear_btn = QPushButton("Clear cache")
+        dir_row.addWidget(browse_btn)
+        dir_row.addWidget(clear_btn)
+        cache_layout.addLayout(dir_row)
 
-    def _on_layer_changed(self, layer_name: str | None):
-        """Update channel index visibility and auto-fill source pixel size from layer scale."""
-        import dask.array as da
-        if not layer_name or layer_name not in self._viewer.layers:
-            self._channel.visible = False
-            return
-        lyr = self._viewer.layers[layer_name]
-        data = lyr.data
-        if not isinstance(data, (np.ndarray, da.Array)):
-            data = data[0]
-        self._channel.visible = data.ndim > 2
-        # pixel size is the layer scale — always in µm because launch.py sets it that way
-        self._px_src.value = round(float(lyr.scale[-1]), 6)
+        collapsible.addWidget(cache_inner)
+        layout.addWidget(collapsible)
 
-    def _on_bg_toggle(self, value):
-        self._rb_rad.visible = bool(value)
+        self._preview_btn.clicked.connect(self._on_preview)
+        self._cache_btn.clicked.connect(self._on_cache)
+        browse_btn.clicked.connect(self._browse_cache_dir)
+        clear_btn.clicked.connect(self._clear_cache)
 
-    def _cache_key(self) -> str:
-        return f"{self._layer.value}[ch{self._channel.value}]@{self._px_tgt.value}µm"
+        viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
+        viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
+        self._refresh_layers()
 
-    def _um2_to_px2(self, um2: float, px_tgt: float) -> int:
-        """Convert µm² area threshold to mask-pixel² (floor, min 1 if nonzero)."""
-        if um2 <= 0:
-            return 0
-        return max(1, int(um2 / px_tgt ** 2))
+    # ── layer list management ──
 
-    def _on_build(self):
-        layer_name = self._layer.value
-        if not layer_name:
-            return
-        src = _get_layer_data_2d(self._viewer, layer_name, self._channel.value)
-        params = self._current_params(layer_name)
-        px_tgt = params.target_px_size
-
-        cache, mask = build_channel_mask(
-            src,
-            px_size_src=params.px_size_src,
-            target_px_size=px_tgt,
-            bg_subtract=params.bg_subtract,
-            rolling_ball_radius=params.rolling_ball_radius / px_tgt,  # µm → mask px
-            gaussian_sigma=params.gaussian_sigma,
-            threshold=params.threshold,
-            hole_threshold=self._um2_to_px2(params.hole_threshold, px_tgt),
-            obj_threshold=self._um2_to_px2(params.obj_threshold, px_tgt),
-        )
-        key = self._cache_key()
-        self._cache[key] = cache
-        self._params[key] = params
-        self._push_labels(mask)
-
-    def _on_apply(self):
-        """Re-threshold using the existing cache — skips the expensive resize step."""
-        key = self._cache_key()
-        cache = self._cache.get(key)
-        if cache is None:
-            print(f"No cache for {key!r} — run 'Build mask' first.")
-            return
-        layer_name = self._layer.value
-        params = self._current_params(layer_name)
-        px_tgt = params.target_px_size
-
-        _, mask = build_channel_mask(
-            None,  # ignored when existing_cache is provided
-            px_size_src=params.px_size_src,
-            target_px_size=px_tgt,
-            gaussian_sigma=params.gaussian_sigma,
-            threshold=params.threshold,
-            hole_threshold=self._um2_to_px2(params.hole_threshold, px_tgt),
-            obj_threshold=self._um2_to_px2(params.obj_threshold, px_tgt),
-            existing_cache=cache,
-        )
-        self._params[key] = params
-        self._push_labels(mask)
-
-    def _on_clear(self):
-        self._cache.clear()
-        self._params.clear()
-        print("Cache cleared.")
+    def _refresh_layers(self):
+        current = self._layer_combo.currentText()
+        self._layer_combo.blockSignals(True)
+        self._layer_combo.clear()
+        self._layer_combo.addItems(_image_layers(self._viewer))
+        if current in _image_layers(self._viewer):
+            self._layer_combo.setCurrentText(current)
+        self._layer_combo.blockSignals(False)
 
     # ── helpers ──
 
-    def _current_params(self, layer_name: str) -> ChannelMaskParams:
-        return ChannelMaskParams(
-            layer_name=layer_name,
-            channel_idx=self._channel.value,
-            px_size_src=self._px_src.value,
-            target_px_size=self._px_tgt.value,
-            bg_subtract=self._bg_sub.value,
-            rolling_ball_radius=self._rb_rad.value,
-            gaussian_sigma=self._sigma.value,
-            threshold=self._thresh.value,
-            hole_threshold=self._holes.value,
-            obj_threshold=self._objs.value,
-        )
+    def _current_inputs(self):
+        """Return (layer, data, radius_px, out_name) or None."""
+        name = self._layer_combo.currentText()
+        if not name or name not in self._viewer.layers:
+            return None
+        layer = self._viewer.layers[name]
+        try:
+            data = _get_layer_data_2d(layer)
+        except ValueError as e:
+            print(f"RollingBallWidget: {e}")
+            return None
+        radius_µm = self._radius_spin.value()
+        radius_px = radius_µm / float(layer.scale[-1])
+        out_name = f"{name}-rb-{radius_µm:.0f}µm"
+        return layer, data, radius_px, out_name
 
-    def _push_labels(self, mask: np.ndarray):
-        """Add or update a Labels layer, deriving scale from the source image layer.
-
-        Scale is computed as source_world_extent / mask_pixels so that integer
-        rounding in lazy_resize doesn't cause the mask to drift from the image.
-        """
-        import dask.array as da
-
-        name = self._name.value or self._cache_key()
-        layer_name = self._layer.value
-
-        src_layer = self._viewer.layers[layer_name]
-        src_data = src_layer.data
-        if not isinstance(src_data, (np.ndarray, da.Array)):
-            src_data = src_data[0]  # full-res level of MultiScaleData
-
-        # world extent of the source layer (µm)
-        src_H, src_W = src_data.shape[-2], src_data.shape[-1]
-        src_scale_y, src_scale_x = src_layer.scale[-2], src_layer.scale[-1]
-        src_tr_y, src_tr_x = src_layer.translate[-2], src_layer.translate[-1]
-
-        # actual mask pixel size that covers exactly the same extent
-        scale_y = src_H * src_scale_y / mask.shape[0]
-        scale_x = src_W * src_scale_x / mask.shape[1]
-        # align pixel-0 edge of mask to pixel-0 edge of source
-        translate_y = src_tr_y - src_scale_y / 2 + scale_y / 2
-        translate_x = src_tr_x - src_scale_x / 2 + scale_x / 2
-
+    def _add_or_replace_image(self, arr, name, scale, translate):
         if name in self._viewer.layers:
             lyr = self._viewer.layers[name]
-            lyr.data = mask.astype(np.uint8)
-            lyr.scale = (scale_y, scale_x)
-            lyr.translate = (translate_y, translate_x)
+            lyr.data = arr
+            lyr.scale = scale
+            lyr.translate = translate
         else:
-            self._viewer.add_labels(
-                mask.astype(np.uint8),
-                name=name,
-                scale=(scale_y, scale_x),
-                translate=(translate_y, translate_x),
+            self._viewer.add_image(arr, name=name, scale=scale, translate=translate)
+
+    # ── button handlers ──
+
+    def _on_preview(self):
+        inputs = self._current_inputs()
+        if inputs is None:
+            return
+        layer, data, radius_px, out_name = inputs
+        lazy_result = subtract_background_lazy(data, radius=radius_px)
+        self._add_or_replace_image(
+            lazy_result, out_name,
+            scale=tuple(layer.scale[-2:]),
+            translate=tuple(layer.translate[-2:]),
+        )
+
+    def _on_cache(self):
+        inputs = self._current_inputs()
+        if inputs is None:
+            return
+        layer, data, radius_px, out_name = inputs
+        zarr_path = str(pathlib.Path(self._cache_dir) / f"{out_name}.zarr")
+        scale = tuple(layer.scale[-2:])
+        translate = tuple(layer.translate[-2:])
+
+        self._cache_btn.setEnabled(False)
+        self._preview_btn.setEnabled(False)
+
+        worker = _rolling_ball_worker(data, radius_px, zarr_path,
+                                      num_workers=os.cpu_count() or 1)
+        worker.returned.connect(
+            lambda arr: self._on_cache_done(arr, out_name, scale, translate)
+        )
+        worker.errored.connect(self._on_worker_error)
+        worker.start()
+
+    def _on_cache_done(self, arr, out_name, scale, translate):
+        self._cache_btn.setEnabled(True)
+        self._preview_btn.setEnabled(True)
+        dask_arr = da.from_zarr(arr)
+        self._add_or_replace_image(dask_arr, out_name, scale, translate)
+
+    def _on_worker_error(self, exc):
+        self._cache_btn.setEnabled(True)
+        self._preview_btn.setEnabled(True)
+        print(f"RollingBallWidget error: {exc}")
+
+    def _browse_cache_dir(self):
+        from qtpy.QtWidgets import QFileDialog
+        d = QFileDialog.getExistingDirectory(self, "Select cache directory", self._cache_dir)
+        if d:
+            self._cache_dir = d
+            self._cache_dir_label.setText(d)
+
+    def _clear_cache(self):
+        import shutil
+        for p in pathlib.Path(self._cache_dir).glob("*.zarr"):
+            shutil.rmtree(p, ignore_errors=True)
+        print(f"Cache cleared: {self._cache_dir}")
+
+
+# ── ThresholdWidget ───────────────────────────────────────────────────────────
+
+
+class ThresholdWidget(QWidget):
+    """Downsample → gaussian → live threshold preview → finalize to Labels layer.
+
+    Layer naming:
+      preview image layer : pre-{source_base_name}
+      final labels layer  : fin-{source_base_name}  (accumulates; no overwrite)
+    """
+
+    def __init__(self, viewer: "napari.Viewer", parent=None):
+        super().__init__(parent)
+        self._viewer = viewer
+        self._preview_layer: "napari.layers.Image | None" = None
+        self._preview_data: np.ndarray | None = None
+        self._src_layer_name: str | None = None
+        self._params_log: dict[str, dict] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setAlignment(Qt.AlignTop)
+
+        layout.addWidget(QLabel("Image layer:"))
+        self._layer_combo = QComboBox()
+        self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
+        layout.addWidget(self._layer_combo)
+
+        form = QFormLayout()
+
+        self._px_src = QDoubleSpinBox()
+        self._px_src.setRange(0.001, 100.0)
+        self._px_src.setValue(0.325)
+        self._px_src.setDecimals(4)
+        self._px_src.setSuffix(" µm/px")
+        form.addRow("Source px size:", self._px_src)
+
+        self._px_tgt = QDoubleSpinBox()
+        self._px_tgt.setRange(0.1, 1000.0)
+        self._px_tgt.setValue(10.0)
+        self._px_tgt.setDecimals(2)
+        self._px_tgt.setSuffix(" µm/px")
+        form.addRow("Mask px size:", self._px_tgt)
+
+        self._sigma = QDoubleSpinBox()
+        self._sigma.setRange(0.0, 50.0)
+        self._sigma.setValue(1.0)
+        self._sigma.setDecimals(1)
+        self._sigma.setSuffix(" px")
+        form.addRow("Gaussian sigma:", self._sigma)
+
+        layout.addLayout(form)
+
+        self._invert = QCheckBox("Invert colormap (brightfield)")
+        self._invert.stateChanged.connect(self._on_invert_changed)
+        layout.addWidget(self._invert)
+
+        self._add_preview_btn = QPushButton("Add Preview Layer")
+        self._add_preview_btn.clicked.connect(self._on_add_preview)
+        layout.addWidget(self._add_preview_btn)
+
+        sep = QLabel()
+        sep.setFrameShape(QLabel.HLine if hasattr(QLabel, "HLine") else 0)
+        layout.addWidget(sep)
+
+        self._thresh_label = QLabel("Threshold: —")
+        layout.addWidget(self._thresh_label)
+
+        form2 = QFormLayout()
+
+        self._holes = QSpinBox()
+        self._holes.setRange(0, 1_000_000_000)
+        self._holes.setValue(1000)
+        self._holes.setSuffix(" µm²")
+        form2.addRow("Fill holes ≤:", self._holes)
+
+        self._objs = QSpinBox()
+        self._objs.setRange(0, 1_000_000_000)
+        self._objs.setValue(1000)
+        self._objs.setSuffix(" µm²")
+        form2.addRow("Remove objects <:", self._objs)
+
+        layout.addLayout(form2)
+
+        self._finalize_btn = QPushButton("Finalize Mask")
+        self._finalize_btn.clicked.connect(self._on_finalize)
+        layout.addWidget(self._finalize_btn)
+
+        viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
+        viewer.layers.events.removed.connect(self._on_layer_removed)
+        self._refresh_layers()
+
+    # ── layer list management ──
+
+    def _refresh_layers(self):
+        current = self._layer_combo.currentText()
+        self._layer_combo.blockSignals(True)
+        self._layer_combo.clear()
+        choices = _image_layers_no_pre(self._viewer)
+        self._layer_combo.addItems(choices)
+        if current in choices:
+            self._layer_combo.setCurrentText(current)
+        self._layer_combo.blockSignals(False)
+
+    def _on_layer_changed(self, name: str):
+        if not name or name not in self._viewer.layers:
+            return
+        layer = self._viewer.layers[name]
+        self._px_src.setValue(round(float(layer.scale[-1]), 6))
+
+    def _on_layer_removed(self, event):
+        removed = event.value
+        if self._preview_layer is not None and removed is self._preview_layer:
+            try:
+                self._preview_layer.events.contrast_limits.disconnect(self._on_contrast_changed)
+            except Exception:
+                pass
+            self._preview_layer = None
+            self._preview_data = None
+            self._thresh_label.setText("Threshold: —")
+        self._refresh_layers()
+
+    # ── contrast limit subscription ──
+
+    def _subscribe_preview(self, layer: "napari.layers.Image"):
+        if self._preview_layer is not None:
+            try:
+                self._preview_layer.events.contrast_limits.disconnect(self._on_contrast_changed)
+            except Exception:
+                pass
+        self._preview_layer = layer
+        layer.events.contrast_limits.connect(self._on_contrast_changed)
+        self._on_contrast_changed()
+
+    def _on_contrast_changed(self):
+        if self._preview_layer is not None:
+            val = self._preview_layer.contrast_limits[0]
+            self._thresh_label.setText(f"Threshold: {val:.1f}")
+
+    def _on_invert_changed(self):
+        if self._preview_layer is not None:
+            self._preview_layer.colormap = _threshold_colormap(self._invert.isChecked())
+
+    # ── Add Preview Layer ──
+
+    def _on_add_preview(self):
+        src_name = self._layer_combo.currentText()
+        if not src_name or src_name not in self._viewer.layers:
+            return
+        src_layer = self._viewer.layers[src_name]
+        try:
+            src_data = _get_layer_data_2d(src_layer)
+        except ValueError as e:
+            print(f"ThresholdWidget: {e}")
+            return
+
+        scale = self._px_src.value() / self._px_tgt.value()
+        sigma = self._sigma.value()
+        self._src_layer_name = src_name
+
+        self._add_preview_btn.setEnabled(False)
+
+        worker = _downsample_worker(src_data, scale, sigma)
+        worker.returned.connect(lambda img: self._on_preview_done(img, src_layer))
+        worker.errored.connect(self._on_preview_error)
+        worker.start()
+
+    def _on_preview_done(self, img: np.ndarray, src_layer: "napari.layers.Image"):
+        self._add_preview_btn.setEnabled(True)
+        self._preview_data = img
+
+        mask_scale, mask_translate = _compute_mask_transform(src_layer, img.shape)
+        pre_name = _pre_name(src_layer.name)
+        cmap = _threshold_colormap(self._invert.isChecked())
+
+        clim = (float(img.min()), float(img.max()))
+
+        if pre_name in self._viewer.layers:
+            lyr = self._viewer.layers[pre_name]
+            lyr.data = img
+            lyr.colormap = cmap
+            lyr.scale = mask_scale
+            lyr.translate = mask_translate
+            lyr.contrast_limits = clim
+            pre_layer = lyr
+        else:
+            pre_layer = self._viewer.add_image(
+                img, name=pre_name, colormap=cmap,
+                scale=mask_scale, translate=mask_translate,
+                contrast_limits=clim,
             )
 
+        self._subscribe_preview(pre_layer)
+
+    def _on_preview_error(self, exc):
+        self._add_preview_btn.setEnabled(True)
+        print(f"ThresholdWidget preview error: {exc}")
+
+    # ── Finalize Mask ──
+
+    def _on_finalize(self):
+        if self._preview_layer is None or self._preview_data is None:
+            print("No preview layer — click 'Add Preview Layer' first.")
+            return
+        if self._src_layer_name not in self._viewer.layers:
+            print("Source layer no longer exists.")
+            return
+
+        threshold = self._preview_layer.contrast_limits[0]
+        px_tgt = self._px_tgt.value()
+
+        hole_px = max(1, int(self._holes.value() / px_tgt ** 2)) if self._holes.value() > 0 else 0
+        obj_px  = max(1, int(self._objs.value()  / px_tgt ** 2)) if self._objs.value()  > 0 else 0
+
+        mask = self._preview_data > threshold
+        if hole_px > 0:
+            mask = remove_small_holes(mask, hole_px, connectivity=2)
+        if obj_px > 0:
+            mask = remove_small_objects(mask, obj_px, connectivity=2)
+
+        src_layer = self._viewer.layers[self._src_layer_name]
+        mask_scale, mask_translate = _compute_mask_transform(src_layer, mask.shape)
+
+        fin_name = _fin_name(self._src_layer_name)
+        fin_layer = self._viewer.add_labels(
+            mask.astype(np.uint8),
+            name=fin_name,
+            scale=mask_scale,
+            translate=mask_translate,
+        )
+
+        self._params_log[fin_layer.name] = {
+            "source_layer": self._src_layer_name,
+            "preview_layer": self._preview_layer.name,
+            "px_size_src_um": self._px_src.value(),
+            "target_px_size_um": px_tgt,
+            "gaussian_sigma_px": self._sigma.value(),
+            "threshold": threshold,
+            "hole_threshold_um2": self._holes.value(),
+            "obj_threshold_um2": self._objs.value(),
+            "invert": self._invert.isChecked(),
+        }
+
+        self._preview_layer.visible = False
+
     def get_params(self) -> dict:
-        return {k: v.to_dict() for k, v in self._params.items()}
+        return dict(self._params_log)
 
 
-# ── Combine widget (dynamic rows, Qt-based) ───────────────────────────────────
+# ── CombineWidget ─────────────────────────────────────────────────────────────
 
 
 class _MaskRow(QWidget):
@@ -345,7 +643,6 @@ class CombineWidget(QWidget):
         root = QVBoxLayout(self)
         root.setAlignment(Qt.AlignTop)
 
-        # scrollable rows area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMaximumHeight(250)
@@ -362,7 +659,7 @@ class CombineWidget(QWidget):
 
         root.addWidget(QLabel("Post-combine cleanup:"))
         self._holes = SpinBox(value=0, min=0, max=100_000_000, label="Fill holes ≤ (µm²)")
-        self._objs = SpinBox(value=0, min=0, max=100_000_000, label="Remove objects < (µm²)")
+        self._objs  = SpinBox(value=0, min=0, max=100_000_000, label="Remove objects < (µm²)")
         root.addWidget(self._holes.native)
         root.addWidget(self._objs.native)
 
@@ -373,10 +670,8 @@ class CombineWidget(QWidget):
         compute_btn.clicked.connect(self._on_compute)
         root.addWidget(compute_btn)
 
-        # params log
         self._last_params: CombineParams | None = None
 
-        # seed row + one data row
         self._add_row(first=True)
         self._add_row()
 
@@ -392,7 +687,7 @@ class CombineWidget(QWidget):
 
     def _remove_row(self, row: _MaskRow):
         if len(self._rows) <= 2:
-            return  # keep at least seed + one
+            return
         self._rows.remove(row)
         self._rows_layout.removeWidget(row)
         row.deleteLater()
@@ -412,21 +707,15 @@ class CombineWidget(QWidget):
                 return
             masks.append(np.asarray(self._viewer.layers[name].data).astype(bool))
 
-        # derive pixel size from the first mask layer's scale for µm² → px² conversion
         px = float(self._viewer.layers[layer_names[0]].scale[-1])
         hole_px = max(1, int(self._holes.value / px ** 2)) if self._holes.value > 0 else 0
         obj_px  = max(1, int(self._objs.value  / px ** 2)) if self._objs.value  > 0 else 0
 
-        result = combine_masks(
-            masks,
-            ops,
-            hole_threshold=hole_px,
-            obj_threshold=obj_px,
-        )
+        result = combine_masks(masks, ops, hole_threshold=hole_px, obj_threshold=obj_px)
 
         self._last_params = CombineParams(
             steps=[{"layer": layer_names[0]}]
-            + [{"op": op, "layer": ln} for op, ln in zip(ops, layer_names[1:])],
+                  + [{"op": op, "layer": ln} for op, ln in zip(ops, layer_names[1:])],
             hole_threshold=self._holes.value,
             obj_threshold=self._objs.value,
         )
@@ -435,20 +724,17 @@ class CombineWidget(QWidget):
         if name in self._viewer.layers:
             self._viewer.layers[name].data = result.astype(np.uint8)
         else:
-            # inherit scale/translate from the first mask layer
             ref = self._viewer.layers[layer_names[0]]
             self._viewer.add_labels(
-                result.astype(np.uint8),
-                name=name,
-                scale=ref.scale,
-                translate=ref.translate,
+                result.astype(np.uint8), name=name,
+                scale=ref.scale, translate=ref.translate,
             )
 
     def get_params(self) -> dict | None:
         return self._last_params.to_dict() if self._last_params else None
 
 
-# ── Export widget ─────────────────────────────────────────────────────────────
+# ── ExportWidget ──────────────────────────────────────────────────────────────
 
 
 class ExportWidget(Container):
@@ -457,11 +743,11 @@ class ExportWidget(Container):
     def __init__(
         self,
         viewer: "napari.Viewer",
-        channel_widget: ChannelMaskWidget | None = None,
+        threshold_widget: ThresholdWidget | None = None,
         combine_widget: CombineWidget | None = None,
     ):
         self._viewer = viewer
-        self._channel_widget = channel_widget
+        self._threshold_widget = threshold_widget
         self._combine_widget = combine_widget
 
         self._layer = ComboBox(
@@ -508,10 +794,9 @@ class ExportWidget(Container):
         else:
             result = export_tiff(mask, out.with_suffix(".tiff"), pixel_size=px)
 
-        # collect all params and write sidecar JSON
         params: dict = {"output_layer": layer_name, "output_file": str(result)}
-        if self._channel_widget:
-            params["channel_masks"] = self._channel_widget.get_params()
+        if self._threshold_widget:
+            params["threshold_masks"] = self._threshold_widget.get_params()
         if self._combine_widget:
             cp = self._combine_widget.get_params()
             if cp:

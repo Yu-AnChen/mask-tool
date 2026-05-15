@@ -1,6 +1,4 @@
 """
-rolling_ball_large.py
-
 Port of imagec's rolling-ball background subtraction for large 2-D images.
 
 Strategy (mirrors imagec's shrink → roll → enlarge approach):
@@ -44,6 +42,16 @@ import numpy as np
 import zarr
 import dask.array as da
 from skimage.restoration import rolling_ball as _skimage_rb
+
+
+# ── dask helper ─────────────────────────────────────────────────────────── #
+
+def _to_dask(src: "zarr.Array | np.ndarray | da.Array", chunk_size: int) -> "da.Array":
+    if isinstance(src, da.Array):
+        return src.rechunk((chunk_size, chunk_size))
+    if isinstance(src, zarr.Array):
+        return da.from_zarr(src, chunks=(chunk_size, chunk_size))
+    return da.from_array(src, chunks=(chunk_size, chunk_size))
 
 
 # ── shrink helpers ───────────────────────────────────────────────────────── #
@@ -136,11 +144,11 @@ def _thread_split(radius: float, n_cores: int) -> tuple[int, int]:
 # ── public API ───────────────────────────────────────────────────────────── #
 
 def rolling_ball_background(
-    src: zarr.Array | np.ndarray,
+    src: "zarr.Array | np.ndarray | da.Array",
     radius: float = 50.0,
     chunk_size: int = 2048,
     omp_threads: int = 1,
-) -> da.Array:
+) -> "da.Array":
     """
     Return a lazy dask array of the estimated rolling-ball background.
 
@@ -149,7 +157,7 @@ def rolling_ball_background(
 
     Parameters
     ----------
-    src         : 2-D zarr.Array or numpy ndarray (uint16 or float32)
+    src         : 2-D zarr.Array, numpy ndarray, or dask Array
     radius      : rolling ball radius in full-image pixels
     chunk_size  : chunk edge in pixels; must be > 2 × radius
     omp_threads : OpenMP threads passed to skimage per block; use
@@ -161,11 +169,7 @@ def rolling_ball_background(
             f"chunk_size ({chunk_size}) must be > 2×radius ({2 * radius:.0f})"
         )
 
-    x = (
-        da.from_zarr(src, chunks=(chunk_size, chunk_size))
-        if isinstance(src, zarr.Array)
-        else da.from_array(src, chunks=(chunk_size, chunk_size))
-    )
+    x = _to_dask(src, chunk_size)
 
     return da.map_overlap(
         partial(_rolling_ball_block, radius=radius, omp_threads=omp_threads),
@@ -177,7 +181,7 @@ def rolling_ball_background(
 
 
 def subtract_background(
-    src: zarr.Array | np.ndarray,
+    src: "zarr.Array | np.ndarray | da.Array",
     radius: float = 50.0,
     chunk_size: int = 2048,
     num_workers: int | None = None,
@@ -188,7 +192,7 @@ def subtract_background(
 
     Parameters
     ----------
-    src         : 2-D zarr.Array or numpy ndarray (uint16 or float32)
+    src         : 2-D zarr.Array, numpy ndarray, or dask Array
     radius      : rolling ball radius in full-image pixels
     chunk_size  : chunk edge in pixels (must be > 2 × radius)
     num_workers : total CPU threads to use; None → os.cpu_count().
@@ -198,30 +202,45 @@ def subtract_background(
 
     Returns
     -------
-    zarr.Array (float32) with background subtracted, clipped to ≥ 0
+    zarr.Array in the source dtype with background subtracted, clipped to ≥ 0
     """
     n_cores = num_workers or os.cpu_count() or 1
     dask_workers, omp_threads = _thread_split(radius, n_cores)
 
-    x = (
-        da.from_zarr(src, chunks=(chunk_size, chunk_size))
-        if isinstance(src, zarr.Array)
-        else da.from_array(src, chunks=(chunk_size, chunk_size))
-    )
+    src_dtype = getattr(src, "dtype", np.float32)
+    x = _to_dask(src, chunk_size)
 
-    bg = rolling_ball_background(src, radius=radius, chunk_size=chunk_size,
+    bg = rolling_ball_background(x, radius=radius, chunk_size=chunk_size,
                                  omp_threads=omp_threads)
-    result = (x.astype(np.float32) - bg).clip(min=0)
+    result = (x.astype(np.float32) - bg).clip(min=0).astype(src_dtype)
 
     out_arr = (
         zarr.open_array(out_path, mode="w", shape=x.shape,
-                        chunks=(chunk_size, chunk_size), dtype=np.float32)
+                        chunks=(chunk_size, chunk_size), dtype=src_dtype)
         if out_path
-        else zarr.zeros(x.shape, chunks=(chunk_size, chunk_size), dtype=np.float32)
+        else zarr.zeros(x.shape, chunks=(chunk_size, chunk_size), dtype=src_dtype)
     )
 
     da.store(result, out_arr, scheduler="threads", num_workers=dask_workers)
     return out_arr
+
+
+def subtract_background_lazy(
+    src: "zarr.Array | np.ndarray | da.Array",
+    radius: float = 50.0,
+    chunk_size: int = 2048,
+) -> "da.Array":
+    """
+    Return a lazy dask array with BG subtracted (no disk write).
+
+    Intended for napari preview layers — tiles are computed on demand as the
+    viewer pans/zooms.  For persistent caching use subtract_background().
+    Output dtype matches the source dtype.
+    """
+    src_dtype = getattr(src, "dtype", np.float32)
+    x = _to_dask(src, chunk_size)
+    bg = rolling_ball_background(x, radius=radius, chunk_size=chunk_size, omp_threads=1)
+    return (x.astype(np.float32) - bg).clip(min=0).astype(src_dtype)
 
 
 # ── smoke test ───────────────────────────────────────────────────────────── #
