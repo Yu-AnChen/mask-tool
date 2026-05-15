@@ -14,7 +14,6 @@ import geojson
 import numpy as np
 import shapely
 import shapely.affinity
-import tifffile
 import zarr
 
 geojson.geometry.DEFAULT_PRECISION = 2
@@ -119,17 +118,18 @@ def export_zarr(
 def export_tiff(
     mask: np.ndarray,
     out_path: str | pathlib.Path,
-    pixel_size: float | None = None,
+    pixel_size: float = 1.0,
 ) -> pathlib.Path:
-    """Write binary mask as a single-page uint8 TIFF."""
+    """Write binary mask as a pyramidal OME-TIFF (palom, is_mask=True)."""
+    from palom.pyramid import write_pyramid
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    resolution = (1e4 / pixel_size, 1e4 / pixel_size) if pixel_size else None
-    tifffile.imwrite(
+    write_pyramid(
+        [mask.astype(np.uint8) * 255],
         out_path,
-        mask.astype(np.uint8) * 255,
-        resolution=resolution,
-        resolutionunit=tifffile.RESUNIT.CENTIMETER if resolution else None,
+        pixel_size=pixel_size,
+        is_mask=True,
+        compression="zlib",
     )
     return out_path
 
