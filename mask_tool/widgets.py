@@ -26,6 +26,7 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -932,13 +933,15 @@ class MaskInfoWidget(QWidget):
         self._placeholder.setStyleSheet("color: gray;")
         root.addWidget(self._placeholder)
 
-        # Dynamic form — rows are rebuilt on each selection change
-        self._form_widget = QWidget()
-        self._form = _form()
-        self._form.setContentsMargins(0, 0, 0, 0)  # must zero the layout, not the widget
-        self._form_widget.setLayout(self._form)
-        self._form_widget.setVisible(False)
-        root.addWidget(self._form_widget)
+        # Grid added directly to root — no QWidget wrapper, which would add
+        # implicit style margins and cause extra indentation vs other sections
+        self._grid_rows: list[tuple[QLabel, QLabel]] = []
+        self._grid = QGridLayout()
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(8)
+        self._grid.setVerticalSpacing(5)
+        self._grid.setColumnStretch(1, 1)
+        root.addLayout(self._grid)
 
         viewer.layers.selection.events.changed.connect(self._on_selection_changed)
         viewer.layers.events.inserted.connect(self._on_layer_inserted)
@@ -958,18 +961,24 @@ class MaskInfoWidget(QWidget):
             return
         self._show_params(params)
 
+    def _clear_grid(self):
+        for lbl, val in self._grid_rows:
+            lbl.deleteLater()
+            val.deleteLater()
+        self._grid_rows.clear()
+
     def _show_placeholder(self):
+        self._clear_grid()
         self._placeholder.setVisible(True)
-        self._form_widget.setVisible(False)
 
     def _show_params(self, params: dict):
-        while self._form.rowCount() > 0:
-            self._form.removeRow(0)
-
-        for label, value in _params_to_rows(params):
-            val_lbl = QLabel(value)
-            val_lbl.setWordWrap(True)
-            self._form.addRow(f"{label}:", val_lbl)
-
+        self._clear_grid()
         self._placeholder.setVisible(False)
-        self._form_widget.setVisible(True)
+        for i, (label, value) in enumerate(_params_to_rows(params)):
+            lbl = QLabel(f"{label}:")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            val = QLabel(value)
+            val.setWordWrap(True)
+            self._grid.addWidget(lbl, i, 0)
+            self._grid.addWidget(val, i, 1)
+            self._grid_rows.append((lbl, val))
