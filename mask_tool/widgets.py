@@ -96,6 +96,36 @@ def _section_label(text: str) -> QLabel:
     return lbl
 
 
+def _params_to_rows(params: dict) -> list[tuple[str, str]]:
+    """Convert a mask_params dict to (label, value) pairs for display."""
+    t = params.get("type", "threshold")
+    if t == "threshold":
+        rows: list[tuple[str, str]] = [
+            ("Source layer",    params["source_layer"]),
+            ("Source px size",  f"{params['px_size_src_um']} µm/px"),
+            ("Mask px size",    f"{params['target_px_size_um']} µm/px"),
+            ("Gaussian sigma",  f"{params['gaussian_sigma_px']} px"),
+            ("Threshold",       f"{params['threshold']:.1f}"),
+            ("Fill holes ≤",    f"{params['hole_threshold_um2']} µm²"),
+            ("Remove objects <", f"{params['obj_threshold_um2']} µm²"),
+        ]
+        if params.get("invert"):
+            rows.append(("Colormap", "inverted"))
+        return rows
+    if t == "combine":
+        steps = params.get("steps", [])
+        parts = [steps[0]["layer"]] if steps else ["—"]
+        for step in steps[1:]:
+            parts.append(step["op"])
+            parts.append(step["layer"])
+        return [
+            ("Expression",      " ".join(parts)),
+            ("Fill holes ≤",    f"{params['hole_threshold_um2']} µm²"),
+            ("Remove objects <", f"{params['obj_threshold_um2']} µm²"),
+        ]
+    return [(k, str(v)) for k, v in params.items() if k != "type"]
+
+
 # ── layer list helpers ────────────────────────────────────────────────────────
 
 
@@ -557,7 +587,8 @@ class ThresholdWidget(QWidget):
             scale=mask_scale, translate=mask_translate,
         )
 
-        self._params_log[fin_layer.name] = {
+        mask_params = {
+            "type": "threshold",
             "source_layer": self._src_layer_name,
             "preview_layer": self._preview_layer.name,
             "px_size_src_um": self._px_src.value(),
@@ -568,6 +599,8 @@ class ThresholdWidget(QWidget):
             "obj_threshold_um2": self._objs.value(),
             "invert": self._invert.isChecked(),
         }
+        fin_layer.metadata["mask_params"] = mask_params
+        self._params_log[fin_layer.name] = mask_params
         self._preview_layer.visible = False
 
     def get_params(self) -> dict:
@@ -718,22 +751,30 @@ class CombineWidget(QWidget):
 
         result = combine_masks(masks, ops, hole_threshold=hole_px, obj_threshold=obj_px)
 
+        steps = [{"layer": layer_names[0]}] + [{"op": op, "layer": ln} for op, ln in zip(ops, layer_names[1:])]
         self._last_params = CombineParams(
-            steps=[{"layer": layer_names[0]}]
-                  + [{"op": op, "layer": ln} for op, ln in zip(ops, layer_names[1:])],
+            steps=steps,
             hole_threshold=self._holes.value(),
             obj_threshold=self._objs.value(),
         )
+        mask_params = {
+            "type": "combine",
+            "steps": steps,
+            "hole_threshold_um2": self._holes.value(),
+            "obj_threshold_um2": self._objs.value(),
+        }
 
         name = self._out_name.text().strip() or "mask_combined"
         if name in self._viewer.layers:
-            self._viewer.layers[name].data = result.astype(np.uint8)
+            out_layer = self._viewer.layers[name]
+            out_layer.data = result.astype(np.uint8)
         else:
             ref = self._viewer.layers[layer_names[0]]
-            self._viewer.add_labels(
+            out_layer = self._viewer.add_labels(
                 result.astype(np.uint8), name=name,
                 scale=ref.scale, translate=ref.translate,
             )
+        out_layer.metadata["mask_params"] = mask_params
 
     def get_params(self) -> dict | None:
         return self._last_params.to_dict() if self._last_params else None
@@ -850,3 +891,60 @@ class ExportWidget(QWidget):
         log_path = pathlib.Path(str(result)).with_suffix(".params.json")
         save_params(params, log_path)
         print(f"Saved: {result}\nParams: {log_path}")
+
+
+# ── MaskInfoWidget ────────────────────────────────────────────────────────────
+
+
+class MaskInfoWidget(QWidget):
+    """Show mask_params metadata for the currently selected Labels layer."""
+
+    def __init__(self, viewer: "napari.Viewer", parent=None):
+        super().__init__(parent)
+        self._viewer = viewer
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self._placeholder = QLabel("Select a mask layer to view its parameters.")
+        self._placeholder.setWordWrap(True)
+        self._placeholder.setStyleSheet("color: gray;")
+        root.addWidget(self._placeholder)
+
+        # Dynamic form — rows are rebuilt on each selection change
+        self._form_widget = QWidget()
+        self._form = _form()
+        self._form_widget.setLayout(self._form)
+        self._form_widget.setVisible(False)
+        root.addWidget(self._form_widget)
+
+        viewer.layers.selection.events.changed.connect(self._on_selection_changed)
+
+    def _on_selection_changed(self, _event=None):
+        selected = list(self._viewer.layers.selection)
+        if len(selected) != 1:
+            self._show_placeholder()
+            return
+        params = selected[0].metadata.get("mask_params")
+        if params is None:
+            self._show_placeholder()
+            return
+        self._show_params(params)
+
+    def _show_placeholder(self):
+        self._placeholder.setVisible(True)
+        self._form_widget.setVisible(False)
+
+    def _show_params(self, params: dict):
+        while self._form.rowCount() > 0:
+            self._form.removeRow(0)
+
+        for label, value in _params_to_rows(params):
+            val_lbl = QLabel(value)
+            val_lbl.setWordWrap(True)
+            self._form.addRow(f"{label}:", val_lbl)
+
+        self._placeholder.setVisible(False)
+        self._form_widget.setVisible(True)

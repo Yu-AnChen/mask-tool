@@ -60,17 +60,19 @@ def main(argv: list[str] | None = None) -> None:
         _load_image(args.image, viewer)
 
     # build and attach widgets
-    from mask_tool.widgets import RollingBallWidget, ThresholdWidget, CombineWidget, ExportWidget
+    from mask_tool.widgets import RollingBallWidget, ThresholdWidget, CombineWidget, ExportWidget, MaskInfoWidget
 
     rb_widget   = RollingBallWidget(viewer)
     thr_widget  = ThresholdWidget(viewer)
     comb_widget = CombineWidget(viewer)
     exp_widget  = ExportWidget(viewer, threshold_widget=thr_widget, combine_widget=comb_widget)
+    info_widget = MaskInfoWidget(viewer)
 
     viewer.window.add_dock_widget(rb_widget,   area="right", name="BG subtraction")
     viewer.window.add_dock_widget(thr_widget,  area="right", name="Threshold")
     viewer.window.add_dock_widget(comb_widget, area="right", name="Combine masks")
     viewer.window.add_dock_widget(exp_widget,  area="right", name="Export")
+    viewer.window.add_dock_widget(info_widget, area="right", name="Mask info")
 
     napari.run()
 
