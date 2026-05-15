@@ -16,15 +16,6 @@ import tempfile
 import cv2
 import dask.array as da
 import numpy as np
-from magicgui.widgets import (
-    ComboBox,
-    Container,
-    FileEdit,
-    FloatSpinBox,
-    LineEdit,
-    PushButton,
-    SpinBox,
-)
 from napari.qt import thread_worker
 from napari.utils import Colormap, progress
 from qtpy.QtCore import Qt
@@ -32,9 +23,12 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -55,19 +49,55 @@ if TYPE_CHECKING:
     import napari.layers
 
 
-# ── module-level helpers ──────────────────────────────────────────────────────
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+
+def _separator() -> QFrame:
+    line = QFrame()
+    line.setFrameShape(QFrame.Shape.HLine)
+    line.setFrameShadow(QFrame.Shadow.Sunken)
+    return line
+
+
+def _dbl_spin(value: float, lo: float, hi: float, decimals: int,
+              suffix: str = "", step: float = 0.0) -> QDoubleSpinBox:
+    w = QDoubleSpinBox()
+    w.setRange(lo, hi)
+    w.setValue(value)
+    w.setDecimals(decimals)
+    if suffix:
+        w.setSuffix(f" {suffix}")
+    if step:
+        w.setSingleStep(step)
+    w.setMinimumWidth(110)
+    return w
+
+
+def _int_spin(value: int, lo: int, hi: int, suffix: str = "") -> QSpinBox:
+    w = QSpinBox()
+    w.setRange(lo, hi)
+    w.setValue(value)
+    if suffix:
+        w.setSuffix(f" {suffix}")
+    w.setMinimumWidth(110)
+    return w
+
+
+def _section_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet("font-weight: bold; margin-top: 4px;")
+    return lbl
+
+
+# ── layer list helpers ────────────────────────────────────────────────────────
 
 
 def _image_layers(viewer: "napari.Viewer") -> list[str]:
     import napari.layers
-    return [
-        lyr.name for lyr in viewer.layers
-        if isinstance(lyr, napari.layers.Image)
-    ]
+    return [lyr.name for lyr in viewer.layers if isinstance(lyr, napari.layers.Image)]
 
 
 def _image_layers_no_pre(viewer: "napari.Viewer") -> list[str]:
-    """Image layers excluding pre-{name} preview layers."""
     import napari.layers
     return [
         lyr.name for lyr in viewer.layers
@@ -80,11 +110,23 @@ def _labels_layers(viewer: "napari.Viewer") -> list[str]:
     return [lyr.name for lyr in viewer.layers if isinstance(lyr, napari.layers.Labels)]
 
 
+def _refresh_combo(combo: QComboBox, choices: list[str]) -> None:
+    current = combo.currentText()
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItems(choices)
+    if current in choices:
+        combo.setCurrentText(current)
+    combo.blockSignals(False)
+
+
+# ── spatial helpers ───────────────────────────────────────────────────────────
+
+
 def _get_layer_data_2d(layer: "napari.layers.Image") -> "np.ndarray | da.Array":
-    """Return the 2-D data array from an Image layer (handles multiscale)."""
     data = layer.data
     if not isinstance(data, (np.ndarray, da.Array)):
-        data = data[0]  # multiscale: take full-res level
+        data = data[0]
     if data.ndim != 2:
         raise ValueError(f"Layer {layer.name!r} is not 2-D (shape={data.shape})")
     return data
@@ -93,11 +135,6 @@ def _get_layer_data_2d(layer: "napari.layers.Image") -> "np.ndarray | da.Array":
 def _compute_mask_transform(
     src_layer: "napari.layers.Image", mask_shape: tuple[int, int]
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Derive napari scale and translate for a mask from its source image layer.
-
-    Uses world-extent / mask_pixels so the mask aligns precisely regardless of
-    per-chunk rounding in lazy_resize.
-    """
     data = src_layer.data
     if not isinstance(data, (np.ndarray, da.Array)):
         data = data[0]
@@ -127,7 +164,6 @@ def _fin_name(src_name: str) -> str:
 
 
 def _threshold_colormap(invert: bool = False) -> Colormap:
-    """Binary-looking colormap: below contrast_limits[0] = black, above = white."""
     if invert:
         return Colormap(["black", "black"], name="threshold_inv",
                         low_color="white", high_color="black")
@@ -135,27 +171,18 @@ def _threshold_colormap(invert: bool = False) -> Colormap:
                     low_color="black", high_color="white")
 
 
-# ── background thread workers ────────────────────────────────────────────────
+# ── background thread workers ─────────────────────────────────────────────────
 
 
 @thread_worker
-def _rolling_ball_worker(
-    data: "np.ndarray | da.Array",
-    radius_px: float,
-    zarr_path: str,
-    num_workers: int,
-):
+def _rolling_ball_worker(data, radius_px: float, zarr_path: str, num_workers: int):
     with progress(total=0, desc="Rolling ball BG subtraction"):
         return subtract_background(data, radius=radius_px, out_path=zarr_path,
                                    num_workers=num_workers)
 
 
 @thread_worker
-def _downsample_worker(
-    src_data: "np.ndarray | da.Array",
-    scale: float,
-    sigma: float,
-):
+def _downsample_worker(src_data, scale: float, sigma: float):
     if not isinstance(src_data, da.Array):
         src_data = da.from_array(src_data)
     img = lazy_resize(src_data, scale=scale).compute()
@@ -170,8 +197,8 @@ def _downsample_worker(
 class RollingBallWidget(QWidget):
     """BG subtraction at source resolution.
 
-    Preview: lazy dask layer, immediate.
-    Cache: computed to zarr in a background thread with progress bar.
+    Preview adds a lazy layer instantly; Cache runs in a background thread
+    and writes to a zarr on disk with a progress bar.
     Output layer name: {source}-rb-{radius}µm
     """
 
@@ -180,50 +207,57 @@ class RollingBallWidget(QWidget):
         self._viewer = viewer
         self._cache_dir = tempfile.mkdtemp(prefix="masktool_rb_")
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setAlignment(Qt.AlignTop)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        layout.addWidget(QLabel("Image layer:"))
+        # ── layer selector ──
+        form_top = QFormLayout()
+        form_top.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self._layer_combo = QComboBox()
-        layout.addWidget(self._layer_combo)
+        form_top.addRow("Image layer:", self._layer_combo)
 
-        form = QFormLayout()
-        self._radius_spin = QDoubleSpinBox()
-        self._radius_spin.setRange(1.0, 100_000.0)
-        self._radius_spin.setValue(25.0)
-        self._radius_spin.setDecimals(1)
-        self._radius_spin.setSuffix(" µm")
-        form.addRow("Ball radius:", self._radius_spin)
-        layout.addLayout(form)
+        self._radius_spin = _dbl_spin(25.0, 1.0, 100_000.0, 1, "µm")
+        form_top.addRow("Ball radius:", self._radius_spin)
+        root.addLayout(form_top)
 
+        root.addWidget(_separator())
+
+        # ── action buttons ──
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         self._preview_btn = QPushButton("Preview")
         self._cache_btn = QPushButton("Cache")
         btn_row.addWidget(self._preview_btn)
         btn_row.addWidget(self._cache_btn)
-        layout.addLayout(btn_row)
+        root.addLayout(btn_row)
+
+        root.addWidget(_separator())
 
         # ── collapsible cache settings ──
         collapsible = QCollapsible("Cache settings", self)
-        cache_inner = QWidget()
-        cache_layout = QVBoxLayout(cache_inner)
-        cache_layout.setContentsMargins(4, 4, 4, 4)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(4, 4, 4, 4)
+        inner_layout.setSpacing(4)
 
         self._cache_dir_label = QLabel(self._cache_dir)
         self._cache_dir_label.setWordWrap(True)
-        cache_layout.addWidget(QLabel("Cache directory:"))
-        cache_layout.addWidget(self._cache_dir_label)
+        self._cache_dir_label.setStyleSheet("color: gray; font-size: 11px;")
+        inner_layout.addWidget(QLabel("Cache directory:"))
+        inner_layout.addWidget(self._cache_dir_label)
 
-        dir_row = QHBoxLayout()
+        btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(6)
         browse_btn = QPushButton("Browse…")
         clear_btn = QPushButton("Clear cache")
-        dir_row.addWidget(browse_btn)
-        dir_row.addWidget(clear_btn)
-        cache_layout.addLayout(dir_row)
+        btn_row2.addWidget(browse_btn)
+        btn_row2.addWidget(clear_btn)
+        inner_layout.addLayout(btn_row2)
 
-        collapsible.addWidget(cache_inner)
-        layout.addWidget(collapsible)
+        collapsible.addWidget(inner)
+        root.addWidget(collapsible)
 
         self._preview_btn.clicked.connect(self._on_preview)
         self._cache_btn.clicked.connect(self._on_cache)
@@ -234,21 +268,10 @@ class RollingBallWidget(QWidget):
         viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
         self._refresh_layers()
 
-    # ── layer list management ──
-
     def _refresh_layers(self):
-        current = self._layer_combo.currentText()
-        self._layer_combo.blockSignals(True)
-        self._layer_combo.clear()
-        self._layer_combo.addItems(_image_layers(self._viewer))
-        if current in _image_layers(self._viewer):
-            self._layer_combo.setCurrentText(current)
-        self._layer_combo.blockSignals(False)
-
-    # ── helpers ──
+        _refresh_combo(self._layer_combo, _image_layers(self._viewer))
 
     def _current_inputs(self):
-        """Return (layer, data, radius_px, out_name) or None."""
         name = self._layer_combo.currentText()
         if not name or name not in self._viewer.layers:
             return None
@@ -271,8 +294,6 @@ class RollingBallWidget(QWidget):
             lyr.translate = translate
         else:
             self._viewer.add_image(arr, name=name, scale=scale, translate=translate)
-
-    # ── button handlers ──
 
     def _on_preview(self):
         inputs = self._current_inputs()
@@ -300,17 +321,14 @@ class RollingBallWidget(QWidget):
 
         worker = _rolling_ball_worker(data, radius_px, zarr_path,
                                       num_workers=os.cpu_count() or 1)
-        worker.returned.connect(
-            lambda arr: self._on_cache_done(arr, out_name, scale, translate)
-        )
+        worker.returned.connect(lambda arr: self._on_cache_done(arr, out_name, scale, translate))
         worker.errored.connect(self._on_worker_error)
         worker.start()
 
     def _on_cache_done(self, arr, out_name, scale, translate):
         self._cache_btn.setEnabled(True)
         self._preview_btn.setEnabled(True)
-        dask_arr = da.from_zarr(arr)
-        self._add_or_replace_image(dask_arr, out_name, scale, translate)
+        self._add_or_replace_image(da.from_zarr(arr), out_name, scale, translate)
 
     def _on_worker_error(self, exc):
         self._cache_btn.setEnabled(True)
@@ -318,7 +336,6 @@ class RollingBallWidget(QWidget):
         print(f"RollingBallWidget error: {exc}")
 
     def _browse_cache_dir(self):
-        from qtpy.QtWidgets import QFileDialog
         d = QFileDialog.getExistingDirectory(self, "Select cache directory", self._cache_dir)
         if d:
             self._cache_dir = d
@@ -350,100 +367,75 @@ class ThresholdWidget(QWidget):
         self._src_layer_name: str | None = None
         self._params_log: dict[str, dict] = {}
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setAlignment(Qt.AlignTop)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        layout.addWidget(QLabel("Image layer:"))
+        # ── parameters ──
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setSpacing(5)
+
         self._layer_combo = QComboBox()
         self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
-        layout.addWidget(self._layer_combo)
+        form.addRow("Image layer:", self._layer_combo)
 
-        form = QFormLayout()
-
-        self._px_src = QDoubleSpinBox()
-        self._px_src.setRange(0.001, 100.0)
-        self._px_src.setValue(0.325)
-        self._px_src.setDecimals(4)
-        self._px_src.setSuffix(" µm/px")
+        self._px_src = _dbl_spin(0.325, 0.001, 100.0, 3, "µm/px")
         form.addRow("Source px size:", self._px_src)
 
-        self._px_tgt = QDoubleSpinBox()
-        self._px_tgt.setRange(0.1, 1000.0)
-        self._px_tgt.setValue(10.0)
-        self._px_tgt.setDecimals(2)
-        self._px_tgt.setSuffix(" µm/px")
+        self._px_tgt = _dbl_spin(10.0, 0.1, 1000.0, 2, "µm/px")
         form.addRow("Mask px size:", self._px_tgt)
 
-        self._sigma = QDoubleSpinBox()
-        self._sigma.setRange(0.0, 50.0)
-        self._sigma.setValue(1.0)
-        self._sigma.setDecimals(1)
-        self._sigma.setSuffix(" px")
+        self._sigma = _dbl_spin(1.0, 0.0, 50.0, 1, "px", step=0.5)
         form.addRow("Gaussian sigma:", self._sigma)
 
-        layout.addLayout(form)
+        root.addLayout(form)
 
-        self._invert = QCheckBox("Invert colormap (brightfield)")
+        self._invert = QCheckBox("Invert colormap  (brightfield)")
         self._invert.stateChanged.connect(self._on_invert_changed)
-        layout.addWidget(self._invert)
+        root.addWidget(self._invert)
 
         self._add_preview_btn = QPushButton("Add Preview Layer")
         self._add_preview_btn.clicked.connect(self._on_add_preview)
-        layout.addWidget(self._add_preview_btn)
+        root.addWidget(self._add_preview_btn)
 
-        sep = QLabel()
-        sep.setFrameShape(QLabel.HLine if hasattr(QLabel, "HLine") else 0)
-        layout.addWidget(sep)
+        root.addWidget(_separator())
 
+        # ── threshold readout ──
         self._thresh_label = QLabel("Threshold: —")
-        layout.addWidget(self._thresh_label)
+        root.addWidget(self._thresh_label)
 
+        # ── cleanup parameters ──
         form2 = QFormLayout()
+        form2.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form2.setSpacing(5)
 
-        self._holes = QSpinBox()
-        self._holes.setRange(0, 1_000_000_000)
-        self._holes.setValue(1000)
-        self._holes.setSuffix(" µm²")
+        self._holes = _int_spin(1000, 0, 1_000_000_000, "µm²")
         form2.addRow("Fill holes ≤:", self._holes)
 
-        self._objs = QSpinBox()
-        self._objs.setRange(0, 1_000_000_000)
-        self._objs.setValue(1000)
-        self._objs.setSuffix(" µm²")
+        self._objs = _int_spin(1000, 0, 1_000_000_000, "µm²")
         form2.addRow("Remove objects <:", self._objs)
 
-        layout.addLayout(form2)
+        root.addLayout(form2)
 
         self._finalize_btn = QPushButton("Finalize Mask")
         self._finalize_btn.clicked.connect(self._on_finalize)
-        layout.addWidget(self._finalize_btn)
+        root.addWidget(self._finalize_btn)
 
         viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
         viewer.layers.events.removed.connect(self._on_layer_removed)
         self._refresh_layers()
 
-    # ── layer list management ──
-
     def _refresh_layers(self):
-        current = self._layer_combo.currentText()
-        self._layer_combo.blockSignals(True)
-        self._layer_combo.clear()
-        choices = _image_layers_no_pre(self._viewer)
-        self._layer_combo.addItems(choices)
-        if current in choices:
-            self._layer_combo.setCurrentText(current)
-        self._layer_combo.blockSignals(False)
+        _refresh_combo(self._layer_combo, _image_layers_no_pre(self._viewer))
 
     def _on_layer_changed(self, name: str):
-        if not name or name not in self._viewer.layers:
-            return
-        layer = self._viewer.layers[name]
-        self._px_src.setValue(round(float(layer.scale[-1]), 6))
+        if name and name in self._viewer.layers:
+            self._px_src.setValue(round(float(self._viewer.layers[name].scale[-1]), 6))
 
     def _on_layer_removed(self, event):
-        removed = event.value
-        if self._preview_layer is not None and removed is self._preview_layer:
+        if self._preview_layer is not None and event.value is self._preview_layer:
             try:
                 self._preview_layer.events.contrast_limits.disconnect(self._on_contrast_changed)
             except Exception:
@@ -452,8 +444,6 @@ class ThresholdWidget(QWidget):
             self._preview_data = None
             self._thresh_label.setText("Threshold: —")
         self._refresh_layers()
-
-    # ── contrast limit subscription ──
 
     def _subscribe_preview(self, layer: "napari.layers.Image"):
         if self._preview_layer is not None:
@@ -474,8 +464,6 @@ class ThresholdWidget(QWidget):
         if self._preview_layer is not None:
             self._preview_layer.colormap = _threshold_colormap(self._invert.isChecked())
 
-    # ── Add Preview Layer ──
-
     def _on_add_preview(self):
         src_name = self._layer_combo.currentText()
         if not src_name or src_name not in self._viewer.layers:
@@ -488,12 +476,10 @@ class ThresholdWidget(QWidget):
             return
 
         scale = self._px_src.value() / self._px_tgt.value()
-        sigma = self._sigma.value()
         self._src_layer_name = src_name
-
         self._add_preview_btn.setEnabled(False)
 
-        worker = _downsample_worker(src_data, scale, sigma)
+        worker = _downsample_worker(src_data, scale, self._sigma.value())
         worker.returned.connect(lambda img: self._on_preview_done(img, src_layer))
         worker.errored.connect(self._on_preview_error)
         worker.start()
@@ -505,7 +491,6 @@ class ThresholdWidget(QWidget):
         mask_scale, mask_translate = _compute_mask_transform(src_layer, img.shape)
         pre_name = _pre_name(src_layer.name)
         cmap = _threshold_colormap(self._invert.isChecked())
-
         clim = (float(img.min()), float(img.max()))
 
         if pre_name in self._viewer.layers:
@@ -529,8 +514,6 @@ class ThresholdWidget(QWidget):
         self._add_preview_btn.setEnabled(True)
         print(f"ThresholdWidget preview error: {exc}")
 
-    # ── Finalize Mask ──
-
     def _on_finalize(self):
         if self._preview_layer is None or self._preview_data is None:
             print("No preview layer — click 'Add Preview Layer' first.")
@@ -541,7 +524,6 @@ class ThresholdWidget(QWidget):
 
         threshold = self._preview_layer.contrast_limits[0]
         px_tgt = self._px_tgt.value()
-
         hole_px = max(1, int(self._holes.value() / px_tgt ** 2)) if self._holes.value() > 0 else 0
         obj_px  = max(1, int(self._objs.value()  / px_tgt ** 2)) if self._objs.value()  > 0 else 0
 
@@ -553,13 +535,10 @@ class ThresholdWidget(QWidget):
 
         src_layer = self._viewer.layers[self._src_layer_name]
         mask_scale, mask_translate = _compute_mask_transform(src_layer, mask.shape)
-
         fin_name = _fin_name(self._src_layer_name)
         fin_layer = self._viewer.add_labels(
-            mask.astype(np.uint8),
-            name=fin_name,
-            scale=mask_scale,
-            translate=mask_translate,
+            mask.astype(np.uint8), name=fin_name,
+            scale=mask_scale, translate=mask_translate,
         )
 
         self._params_log[fin_layer.name] = {
@@ -573,7 +552,6 @@ class ThresholdWidget(QWidget):
             "obj_threshold_um2": self._objs.value(),
             "invert": self._invert.isChecked(),
         }
-
         self._preview_layer.visible = False
 
     def get_params(self) -> dict:
@@ -584,17 +562,19 @@ class ThresholdWidget(QWidget):
 
 
 class _MaskRow(QWidget):
-    """One row in the combine list: [op ▾] [layer ▾] [−]"""
+    """One row: [op ▾] [layer ▾] [−]"""
 
     def __init__(self, viewer: "napari.Viewer", first: bool = False, parent=None):
         super().__init__(parent)
         self._viewer = viewer
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
         if first:
             lbl = QLabel("seed")
-            lbl.setFixedWidth(70)
+            lbl.setFixedWidth(60)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(lbl)
         else:
             self.op_combo = QComboBox()
@@ -603,12 +583,12 @@ class _MaskRow(QWidget):
             layout.addWidget(self.op_combo)
 
         self.layer_combo = QComboBox()
-        self.layer_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.layer_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.layer_combo)
 
         if not first:
             rm_btn = QPushButton("−")
-            rm_btn.setFixedWidth(24)
+            rm_btn.setFixedWidth(26)
             layout.addWidget(rm_btn)
             self._rm_btn = rm_btn
 
@@ -616,12 +596,7 @@ class _MaskRow(QWidget):
         self.refresh_layers()
 
     def refresh_layers(self):
-        current = self.layer_combo.currentText()
-        self.layer_combo.clear()
-        choices = _labels_layers(self._viewer)
-        self.layer_combo.addItems(choices)
-        if current in choices:
-            self.layer_combo.setCurrentText(current)
+        _refresh_combo(self.layer_combo, _labels_layers(self._viewer))
 
     @property
     def op(self) -> str | None:
@@ -639,38 +614,53 @@ class CombineWidget(QWidget):
         super().__init__(parent)
         self._viewer = viewer
         self._rows: list[_MaskRow] = []
+        self._last_params: CombineParams | None = None
 
         root = QVBoxLayout(self)
-        root.setAlignment(Qt.AlignTop)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        root.addWidget(_section_label("Masks to combine:"))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(250)
+        scroll.setMaximumHeight(200)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._rows_container = QWidget()
         self._rows_layout = QVBoxLayout(self._rows_container)
-        self._rows_layout.setAlignment(Qt.AlignTop)
+        self._rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._rows_layout.setSpacing(3)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
         scroll.setWidget(self._rows_container)
-        root.addWidget(QLabel("Masks to combine:"))
         root.addWidget(scroll)
 
         add_btn = QPushButton("+ Add layer")
         add_btn.clicked.connect(self._add_row)
         root.addWidget(add_btn)
 
-        root.addWidget(QLabel("Post-combine cleanup:"))
-        self._holes = SpinBox(value=0, min=0, max=100_000_000, label="Fill holes ≤ (µm²)")
-        self._objs  = SpinBox(value=0, min=0, max=100_000_000, label="Remove objects < (µm²)")
-        root.addWidget(self._holes.native)
-        root.addWidget(self._objs.native)
+        root.addWidget(_separator())
 
-        self._out_name = LineEdit(value="mask_combined", label="Output layer name")
-        root.addWidget(self._out_name.native)
+        root.addWidget(_section_label("Post-combine cleanup:"))
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setSpacing(5)
+
+        self._holes = _int_spin(0, 0, 1_000_000_000, "µm²")
+        form.addRow("Fill holes ≤:", self._holes)
+
+        self._objs = _int_spin(0, 0, 1_000_000_000, "µm²")
+        form.addRow("Remove objects <:", self._objs)
+
+        self._out_name = QLineEdit("mask_combined")
+        form.addRow("Output name:", self._out_name)
+
+        root.addLayout(form)
 
         compute_btn = QPushButton("Compute")
         compute_btn.clicked.connect(self._on_compute)
         root.addWidget(compute_btn)
-
-        self._last_params: CombineParams | None = None
 
         self._add_row(first=True)
         self._add_row()
@@ -708,19 +698,19 @@ class CombineWidget(QWidget):
             masks.append(np.asarray(self._viewer.layers[name].data).astype(bool))
 
         px = float(self._viewer.layers[layer_names[0]].scale[-1])
-        hole_px = max(1, int(self._holes.value / px ** 2)) if self._holes.value > 0 else 0
-        obj_px  = max(1, int(self._objs.value  / px ** 2)) if self._objs.value  > 0 else 0
+        hole_px = max(1, int(self._holes.value() / px ** 2)) if self._holes.value() > 0 else 0
+        obj_px  = max(1, int(self._objs.value()  / px ** 2)) if self._objs.value()  > 0 else 0
 
         result = combine_masks(masks, ops, hole_threshold=hole_px, obj_threshold=obj_px)
 
         self._last_params = CombineParams(
             steps=[{"layer": layer_names[0]}]
                   + [{"op": op, "layer": ln} for op, ln in zip(ops, layer_names[1:])],
-            hole_threshold=self._holes.value,
-            obj_threshold=self._objs.value,
+            hole_threshold=self._holes.value(),
+            obj_threshold=self._objs.value(),
         )
 
-        name = self._out_name.value or "mask_combined"
+        name = self._out_name.text().strip() or "mask_combined"
         if name in self._viewer.layers:
             self._viewer.layers[name].data = result.astype(np.uint8)
         else:
@@ -737,53 +727,93 @@ class CombineWidget(QWidget):
 # ── ExportWidget ──────────────────────────────────────────────────────────────
 
 
-class ExportWidget(Container):
-    """Export a Labels layer as GeoJSON / Zarr / TIFF and write params JSON."""
+class ExportWidget(QWidget):
+    """Export a Labels layer as GeoJSON / Zarr / TIFF and write a params JSON sidecar."""
 
     def __init__(
         self,
         viewer: "napari.Viewer",
         threshold_widget: ThresholdWidget | None = None,
         combine_widget: CombineWidget | None = None,
+        parent=None,
     ):
+        super().__init__(parent)
         self._viewer = viewer
         self._threshold_widget = threshold_widget
         self._combine_widget = combine_widget
 
-        self._layer = ComboBox(
-            choices=lambda _w: _labels_layers(viewer),
-            label="Mask layer",
-        )
-        self._px_size = FloatSpinBox(value=10.0, min=0.001, max=1000.0,
-                                     label="Pixel size (µm)")
-        self._format = ComboBox(
-            choices=["GeoJSON", "GeoJSON (zip)", "Zarr", "TIFF"],
-            label="Format",
-        )
-        self._out_path = FileEdit(
-            value=pathlib.Path.home() / "mask.geojson",
-            label="Output path",
-            mode="w",
-        )
-        self._btn_export = PushButton(text="Save mask + log params")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        super().__init__(widgets=[
-            self._layer, self._px_size, self._format, self._out_path, self._btn_export
-        ])
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setSpacing(5)
 
-        self._btn_export.changed.connect(self._on_export)
-        viewer.layers.events.inserted.connect(lambda _: self._layer.reset_choices())
-        viewer.layers.events.removed.connect(lambda _: self._layer.reset_choices())
+        self._layer_combo = QComboBox()
+        form.addRow("Mask layer:", self._layer_combo)
+
+        self._px_size = _dbl_spin(10.0, 0.001, 1000.0, 3, "µm/px")
+        form.addRow("Pixel size:", self._px_size)
+
+        self._format_combo = QComboBox()
+        self._format_combo.addItems(["GeoJSON", "GeoJSON (zip)", "Zarr", "TIFF"])
+        self._format_combo.currentTextChanged.connect(self._on_format_changed)
+        form.addRow("Format:", self._format_combo)
+
+        # file path row: line edit + browse button
+        path_widget = QWidget()
+        path_layout = QHBoxLayout(path_widget)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(4)
+        self._out_path = QLineEdit(str(pathlib.Path.home() / "mask.geojson"))
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(28)
+        browse_btn.clicked.connect(self._browse_output)
+        path_layout.addWidget(self._out_path)
+        path_layout.addWidget(browse_btn)
+        form.addRow("Output path:", path_widget)
+
+        root.addLayout(form)
+
+        export_btn = QPushButton("Save mask + log params")
+        export_btn.clicked.connect(self._on_export)
+        root.addWidget(export_btn)
+
+        viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
+        viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
+        self._refresh_layers()
+
+    def _refresh_layers(self):
+        _refresh_combo(self._layer_combo, _labels_layers(self._viewer))
+
+    def _on_format_changed(self, fmt: str):
+        path = pathlib.Path(self._out_path.text())
+        ext_map = {
+            "GeoJSON": ".geojson",
+            "GeoJSON (zip)": ".geojson",
+            "Zarr": ".zarr",
+            "TIFF": ".tiff",
+        }
+        self._out_path.setText(str(path.with_suffix(ext_map.get(fmt, ".geojson"))))
+
+    def _browse_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save mask", self._out_path.text()
+        )
+        if path:
+            self._out_path.setText(path)
 
     def _on_export(self):
-        layer_name = self._layer.value
-        if not layer_name:
+        layer_name = self._layer_combo.currentText()
+        if not layer_name or layer_name not in self._viewer.layers:
             return
 
         mask = np.asarray(self._viewer.layers[layer_name].data).astype(bool)
-        px = self._px_size.value
-        out = pathlib.Path(str(self._out_path.value))
-        fmt = self._format.value
+        px = self._px_size.value()
+        out = pathlib.Path(self._out_path.text())
+        fmt = self._format_combo.currentText()
 
         if fmt == "GeoJSON":
             result = export_geojson(mask, px, out.with_suffix(".geojson"))
