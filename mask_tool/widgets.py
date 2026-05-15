@@ -301,10 +301,22 @@ class RollingBallWidget(QWidget):
 
         viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
         viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
+        viewer.layers.selection.events.changed.connect(self._on_selection_changed)
         self._refresh_layers()
 
     def _refresh_layers(self):
         _refresh_combo(self._layer_combo, _image_layers(self._viewer))
+
+    def _on_selection_changed(self, _event=None):
+        import napari.layers
+        selected = list(self._viewer.layers.selection)
+        if len(selected) != 1:
+            return
+        layer = selected[0]
+        if not isinstance(layer, napari.layers.Image):
+            return
+        if layer.name in _image_layers(self._viewer):
+            self._layer_combo.setCurrentText(layer.name)
 
     def _current_inputs(self):
         name = self._layer_combo.currentText()
