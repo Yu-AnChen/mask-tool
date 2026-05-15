@@ -448,9 +448,13 @@ class ThresholdWidget(QWidget):
 
         root.addLayout(form)
 
-        self._sigma.valueChanged.connect(self._apply_sigma)
-        self._px_src.valueChanged.connect(self._on_px_size_changed)
-        self._px_tgt.valueChanged.connect(self._on_px_size_changed)
+        from superqt.utils import qdebounced
+        self._debounced_sigma = qdebounced(self._apply_sigma, timeout=300, leading=True)
+        self._sigma.valueChanged.connect(self._debounced_sigma)
+
+        self._debounced_px = qdebounced(self._on_px_size_changed, timeout=400, leading=True)
+        self._px_src.valueChanged.connect(self._debounced_px)
+        self._px_tgt.valueChanged.connect(self._debounced_px)
 
         self._invert = QCheckBox("Invert colormap  (brightfield)")
         self._invert.stateChanged.connect(self._on_invert_changed)
