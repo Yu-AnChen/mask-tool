@@ -441,12 +441,11 @@ class ThresholdWidget(QWidget):
 
         root.addWidget(_separator())
 
-        # ── threshold readout ──
-        self._thresh_label = QLabel("Threshold: —")
-        root.addWidget(self._thresh_label)
-
-        # ── cleanup parameters ──
+        # ── threshold readout + cleanup parameters ──
         form2 = _form()
+
+        self._thresh_label = QLabel("—")
+        form2.addRow("Threshold:", self._thresh_label)
 
         self._holes = _int_spin(1000, 0, 1_000_000_000, "µm²")
         form2.addRow("Fill holes ≤:", self._holes)
@@ -481,7 +480,7 @@ class ThresholdWidget(QWidget):
             self._preview_layer = None
             self._preview_raw = None
             self._preview_data = None
-            self._thresh_label.setText("Threshold: —")
+            self._thresh_label.setText("—")
         self._refresh_layers()
 
     def _subscribe_preview(self, layer: "napari.layers.Image"):
@@ -497,7 +496,7 @@ class ThresholdWidget(QWidget):
     def _on_contrast_changed(self):
         if self._preview_layer is not None:
             val = self._preview_layer.contrast_limits[0]
-            self._thresh_label.setText(f"Threshold: {val:.1f}")
+            self._thresh_label.setText(f"{val:.1f}")
 
     def _on_invert_changed(self):
         if self._preview_layer is not None:
@@ -827,7 +826,7 @@ class ExportWidget(QWidget):
         self._layer_combo.setFixedHeight(_FIELD_H)
         form.addRow("Mask layer:", self._layer_combo)
 
-        self._px_size = _dbl_spin(10.0, 0.001, 1000.0, 3, "µm/px")
+        self._px_size = _dbl_spin(10.0, 0.001, 1000.0, 2, "µm/px")
         form.addRow("Pixel size:", self._px_size)
 
         self._format_combo = QComboBox()
@@ -935,8 +934,8 @@ class MaskInfoWidget(QWidget):
 
         # Dynamic form — rows are rebuilt on each selection change
         self._form_widget = QWidget()
-        self._form_widget.setContentsMargins(0, 0, 0, 0)
         self._form = _form()
+        self._form.setContentsMargins(0, 0, 0, 0)  # must zero the layout, not the widget
         self._form_widget.setLayout(self._form)
         self._form_widget.setVisible(False)
         root.addWidget(self._form_widget)
