@@ -13,6 +13,7 @@ into RAM until a mask is built.
 
 from __future__ import annotations
 
+import signal
 import sys
 import argparse
 
@@ -73,6 +74,15 @@ def main(argv: list[str] | None = None) -> None:
     viewer.window.add_dock_widget(comb_widget, area="right", name="Combine masks")
     viewer.window.add_dock_widget(exp_widget,  area="right", name="Export")
     viewer.window.add_dock_widget(info_widget, area="right", name="Mask info")
+
+    # Qt's C++ event loop doesn't deliver Python signals unless the interpreter
+    # gets control periodically; the no-op timer wakes it every 200 ms so
+    # Ctrl+C reaches the handler and viewer.close() can clean up normally.
+    from qtpy.QtCore import QTimer
+    _sigint_timer = QTimer()
+    _sigint_timer.start(200)
+    _sigint_timer.timeout.connect(lambda: None)
+    signal.signal(signal.SIGINT, lambda *_: viewer.close())
 
     napari.run()
 
