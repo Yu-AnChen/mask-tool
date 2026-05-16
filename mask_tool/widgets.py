@@ -229,6 +229,11 @@ def _threshold_colormap(invert: bool = False) -> Colormap:
                     low_color="black", high_color="white")
 
 
+def _change_suffix(path: pathlib.Path, new_suffix: str) -> pathlib.Path:
+    """Replace all suffixes (handles multi-part suffixes like .ome.tif)."""
+    return path.with_name(path.name.split(".")[0] + new_suffix)
+
+
 # ── background thread workers ─────────────────────────────────────────────────
 
 
@@ -243,6 +248,21 @@ def _downsample_worker(src_data, scale: float):
     if not isinstance(src_data, da.Array):
         src_data = da.from_array(src_data)
     return lazy_resize(src_data, scale=scale).compute()
+
+
+@thread_worker
+def _finalize_mask_worker(preview_data: np.ndarray, threshold, hole_px: int, obj_px: int):
+    mask = preview_data > threshold
+    if hole_px > 0:
+        mask = remove_small_holes(mask, hole_px, connectivity=2)
+    if obj_px > 0:
+        mask = remove_small_objects(mask, obj_px, connectivity=2)
+    return mask
+
+
+@thread_worker
+def _combine_mask_worker(masks, ops, hole_px: int, obj_px: int):
+    return combine_masks(masks, ops, hole_threshold=hole_px, obj_threshold=obj_px)
 
 
 # ── RollingBallWidget ─────────────────────────────────────────────────────────
@@ -636,23 +656,12 @@ class ThresholdWidget(QWidget):
         hole_px = max(1, int(self._holes.value() / px_tgt ** 2)) if self._holes.value() > 0 else 0
         obj_px  = max(1, int(self._objs.value()  / px_tgt ** 2)) if self._objs.value()  > 0 else 0
 
-        mask = self._preview_data > threshold
-        if hole_px > 0:
-            mask = remove_small_holes(mask, hole_px, connectivity=2)
-        if obj_px > 0:
-            mask = remove_small_objects(mask, obj_px, connectivity=2)
-
-        src_layer = self._viewer.layers[self._src_layer_name]
-        mask_scale, mask_translate = _compute_mask_transform(src_layer, mask.shape)
-        fin_name = _fin_name(self._src_layer_name)
-        fin_layer = self._viewer.add_labels(
-            mask.astype(np.uint8) * _next_label(self._viewer), name=fin_name,
-            scale=mask_scale, translate=mask_translate,
-        )
-
+        src_layer_name = self._src_layer_name
+        src_layer = self._viewer.layers[src_layer_name]
+        mask_scale, mask_translate = _compute_mask_transform(src_layer, self._preview_data.shape)
         mask_params = {
             "type": "threshold",
-            "source_layer": self._src_layer_name,
+            "source_layer": src_layer_name,
             "preview_layer": self._preview_layer.name,
             "px_size_src_um": self._px_src.value(),
             "target_px_size_um": px_tgt,
@@ -662,9 +671,32 @@ class ThresholdWidget(QWidget):
             "obj_threshold_um2": self._objs.value(),
             "invert": self._invert.isChecked(),
         }
+
+        self._finalize_btn.setEnabled(False)
+        worker = _finalize_mask_worker(self._preview_data.copy(), threshold, hole_px, obj_px)
+        worker.returned.connect(
+            lambda mask: self._on_finalize_done(
+                mask, src_layer_name, mask_scale, mask_translate, mask_params
+            )
+        )
+        worker.errored.connect(self._on_finalize_error)
+        worker.start()
+
+    def _on_finalize_done(self, mask, src_layer_name, mask_scale, mask_translate, mask_params):
+        self._finalize_btn.setEnabled(True)
+        fin_name = _fin_name(src_layer_name)
+        fin_layer = self._viewer.add_labels(
+            mask.astype(np.uint8) * _next_label(self._viewer), name=fin_name,
+            scale=mask_scale, translate=mask_translate,
+        )
         fin_layer.metadata["mask_params"] = mask_params
         self._params_log[fin_layer.name] = mask_params
-        self._preview_layer.visible = False
+        if self._preview_layer is not None:
+            self._preview_layer.visible = False
+
+    def _on_finalize_error(self, exc):
+        self._finalize_btn.setEnabled(True)
+        print(f"ThresholdWidget finalize error: {exc}")
 
     def get_params(self) -> dict:
         return dict(self._params_log)
@@ -793,9 +825,9 @@ class CombineWidget(QWidget):
 
         root.addLayout(form)
 
-        compute_btn = QPushButton("Finalize combined mask")
-        compute_btn.clicked.connect(self._on_compute)
-        root.addWidget(compute_btn)
+        self._compute_btn = QPushButton("Finalize combined mask")
+        self._compute_btn.clicked.connect(self._on_compute)
+        root.addWidget(self._compute_btn)
 
         self._add_row(first=True)
         self._add_row()
@@ -855,33 +887,47 @@ class CombineWidget(QWidget):
         hole_px = max(1, int(self._holes.value() / px ** 2)) if self._holes.value() > 0 else 0
         obj_px  = max(1, int(self._objs.value()  / px ** 2)) if self._objs.value()  > 0 else 0
 
-        result = combine_masks(masks, ops, hole_threshold=hole_px, obj_threshold=obj_px)
-
         steps = [{"layer": layer_names[0]}] + [{"op": op, "layer": ln} for op, ln in zip(ops, layer_names[1:])]
-        self._last_params = CombineParams(
-            steps=steps,
-            hole_threshold=self._holes.value(),
-            obj_threshold=self._objs.value(),
-        )
         mask_params = {
             "type": "combine",
             "steps": steps,
             "hole_threshold_um2": self._holes.value(),
             "obj_threshold_um2": self._objs.value(),
         }
+        ref_layer = self._viewer.layers[layer_names[0]]
+        out_name = self._out_name.text().strip() or "mask_combined"
 
-        name = self._out_name.text().strip() or "mask_combined"
-        if name in self._viewer.layers:
-            out_layer = self._viewer.layers[name]
+        self._compute_btn.setEnabled(False)
+        worker = _combine_mask_worker(masks, ops, hole_px, obj_px)
+        worker.returned.connect(
+            lambda result: self._on_compute_done(
+                result, mask_params, ref_layer.scale, ref_layer.translate, out_name
+            )
+        )
+        worker.errored.connect(self._on_compute_error)
+        worker.start()
+
+    def _on_compute_done(self, result, mask_params, ref_scale, ref_translate, out_name):
+        self._compute_btn.setEnabled(True)
+        self._last_params = CombineParams(
+            steps=mask_params["steps"],
+            hole_threshold=mask_params["hole_threshold_um2"],
+            obj_threshold=mask_params["obj_threshold_um2"],
+        )
+        if out_name in self._viewer.layers:
+            out_layer = self._viewer.layers[out_name]
             label_val = int(out_layer.data.max()) or 1
             out_layer.data = result.astype(np.uint8) * label_val
         else:
-            ref = self._viewer.layers[layer_names[0]]
             out_layer = self._viewer.add_labels(
-                result.astype(np.uint8) * _next_label(self._viewer), name=name,
-                scale=ref.scale, translate=ref.translate,
+                result.astype(np.uint8) * _next_label(self._viewer), name=out_name,
+                scale=ref_scale, translate=ref_translate,
             )
         out_layer.metadata["mask_params"] = mask_params
+
+    def _on_compute_error(self, exc):
+        self._compute_btn.setEnabled(True)
+        print(f"CombineWidget compute error: {exc}")
 
     def get_params(self) -> dict | None:
         return self._last_params.to_dict() if self._last_params else None
@@ -968,9 +1014,9 @@ class ExportWidget(QWidget):
             "GeoJSON": ".geojson",
             "GeoJSON (zip)": ".geojson",
             "Zarr": ".zarr",
-            "TIFF": ".tiff",
+            "TIFF": ".ome.tif",
         }
-        self._out_path.setText(str(path.with_suffix(ext_map.get(fmt, ".geojson"))))
+        self._out_path.setText(str(_change_suffix(path, ext_map.get(fmt, ".geojson"))))
         self._px_size.setEnabled(fmt.startswith("GeoJSON"))
 
     def _browse_output(self):
@@ -979,8 +1025,10 @@ class ExportWidget(QWidget):
         )
         if path:
             self._out_path.setText(path)
+            self._on_export()
 
     def _on_export(self):
+        from napari.utils.notifications import show_info
         layer_name = self._layer_combo.currentText()
         if not layer_name or layer_name not in self._viewer.layers:
             return
@@ -991,15 +1039,17 @@ class ExportWidget(QWidget):
         fmt = self._format_combo.currentText()
 
         if fmt == "GeoJSON":
-            result = export_geojson(mask, px, out.with_suffix(".geojson"))
+            result_path = export_geojson(mask, px, _change_suffix(out, ".geojson"))
         elif fmt == "GeoJSON (zip)":
-            result = export_geojson(mask, px, out.with_suffix(".geojson"), compress=True)
+            result_path = export_geojson(mask, px, _change_suffix(out, ".geojson"), compress=True)
         elif fmt == "Zarr":
-            result = export_zarr(mask, out, pixel_size=px)
+            result_path = _change_suffix(out, ".zarr")
+            export_zarr(mask, result_path, pixel_size=px)
         else:
-            result = export_tiff(mask, out.with_suffix(".tiff"), pixel_size=px)
+            result_path = _change_suffix(out, ".ome.tif")
+            export_tiff(mask, result_path, pixel_size=px)
 
-        params: dict = {"output_layer": layer_name, "output_file": str(result)}
+        params: dict = {"output_layer": layer_name, "output_file": str(result_path)}
         if self._threshold_widget:
             params["threshold_masks"] = self._threshold_widget.get_params()
         if self._combine_widget:
@@ -1007,9 +1057,11 @@ class ExportWidget(QWidget):
             if cp:
                 params["combine"] = cp
 
-        log_path = pathlib.Path(str(result)).with_suffix(".params.json")
+        log_name = result_path.name.replace(".", "_") + "-params.json"
+        log_path = result_path.parent / log_name
         save_params(params, log_path)
-        print(f"Saved: {result}\nParams: {log_path}")
+        print(f"Saved: {result_path}\nParams: {log_path}")
+        show_info(f"Saved {result_path.name}\n{log_path.name}")
 
 
 # ── MaskInfoWidget ────────────────────────────────────────────────────────────
