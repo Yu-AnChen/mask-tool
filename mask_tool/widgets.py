@@ -944,12 +944,14 @@ class ExportWidget(QWidget):
         viewer: "napari.Viewer",
         threshold_widget: ThresholdWidget | None = None,
         combine_widget: CombineWidget | None = None,
+        default_path: "str | pathlib.Path | None" = None,
         parent=None,
     ):
         super().__init__(parent)
         self._viewer = viewer
         self._threshold_widget = threshold_widget
         self._combine_widget = combine_widget
+        self._default_path = pathlib.Path(default_path) if default_path else pathlib.Path.home() / "mask.geojson"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -978,7 +980,7 @@ class ExportWidget(QWidget):
         path_layout = QHBoxLayout(path_widget)
         path_layout.setContentsMargins(0, 0, 0, 0)
         path_layout.setSpacing(4)
-        self._out_path = QLineEdit(str(pathlib.Path.home() / "mask.geojson"))
+        self._out_path = QLineEdit(str(self._default_path))
         self._out_path.setFixedHeight(_FIELD_H)
         browse_btn = QPushButton("…")
         browse_btn.setFixedWidth(28)

@@ -8,6 +8,7 @@ Usage
   pixi run python launch.py path/to/image.ome.tiff --channels 0 2 5
   pixi run python launch.py path/to/image.ome.tiff --channel-names DAPI CD31 aSMA
   pixi run python launch.py path/to/image.ome.tiff --channels 0 2 5 --channel-names DAPI CD31 aSMA
+  pixi run python launch.py path/to/image.ome.tiff --out-dir /path/to/output --id sample01
 
 The image is loaded as a multiscale dask array via palom so no data is read
 into RAM until a mask is built.
@@ -101,6 +102,14 @@ def main(argv: list[str] | None = None) -> None:
         "--channel-names", nargs="+", metavar="NAME",
         help="Channel names; must match --channels count (or total channels if --channels omitted)",
     )
+    parser.add_argument(
+        "--out-dir", metavar="DIR",
+        help="Default output directory for exported masks",
+    )
+    parser.add_argument(
+        "--id", metavar="ID",
+        help="Sample identifier; exported files default to {id}-mask.geojson / {id}-mask.ome.tif",
+    )
     args = parser.parse_args(argv)
 
     if args.channels is not None and args.channel_names is not None:
@@ -122,10 +131,15 @@ def main(argv: list[str] | None = None) -> None:
     # build and attach widgets
     from mask_tool.widgets import RollingBallWidget, ThresholdWidget, CombineWidget, ExportWidget, MaskInfoWidget
 
+    out_dir = pathlib.Path(args.out_dir) if args.out_dir else pathlib.Path.home()
+    stem = f"{args.id}-mask" if args.id else "mask"
+    default_export_path = out_dir / f"{stem}.geojson"
+
     rb_widget   = RollingBallWidget(viewer)
     thr_widget  = ThresholdWidget(viewer)
     comb_widget = CombineWidget(viewer)
-    exp_widget  = ExportWidget(viewer, threshold_widget=thr_widget, combine_widget=comb_widget)
+    exp_widget  = ExportWidget(viewer, threshold_widget=thr_widget, combine_widget=comb_widget,
+                               default_path=default_export_path)
     info_widget = MaskInfoWidget(viewer)
 
     viewer.window.add_dock_widget(rb_widget,   area="right", name="BG subtraction")
