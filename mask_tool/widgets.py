@@ -630,6 +630,8 @@ class ThresholdWidget(QWidget):
             return
 
         threshold = self._preview_layer.contrast_limits[0]
+        if np.issubdtype(self._preview_data.dtype, np.integer):
+            threshold = int(threshold)
         px_tgt = self._px_tgt.value()
         hole_px = max(1, int(self._holes.value() / px_tgt ** 2)) if self._holes.value() > 0 else 0
         obj_px  = max(1, int(self._objs.value()  / px_tgt ** 2)) if self._objs.value()  > 0 else 0
