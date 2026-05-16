@@ -768,7 +768,7 @@ class CombineWidget(QWidget):
         scroll.setWidget(self._rows_container)
         root.addWidget(scroll)
 
-        add_btn = QPushButton("+ Add mask")
+        add_btn = QPushButton("+ Add row")
         add_btn.clicked.connect(self._add_row)
         root.addWidget(add_btn)
 
@@ -791,7 +791,7 @@ class CombineWidget(QWidget):
 
         root.addLayout(form)
 
-        compute_btn = QPushButton("Compute")
+        compute_btn = QPushButton("Finalize combined mask")
         compute_btn.clicked.connect(self._on_compute)
         root.addWidget(compute_btn)
 
@@ -941,7 +941,7 @@ class ExportWidget(QWidget):
 
         root.addLayout(form)
 
-        export_btn = QPushButton("Save mask + log params")
+        export_btn = QPushButton("Save mask and params")
         export_btn.clicked.connect(self._on_export)
         root.addWidget(export_btn)
 
