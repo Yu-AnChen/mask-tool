@@ -16,165 +16,185 @@ that is lazily evaluated (dask + zarr), parameterized, and reusable across chann
 
 ```
 For each channel mask:
-  OME-TIFF
-    → channel select
-    → resize to target pixel size         [lazy, map_overlap, INTER_AREA]
-    → [optional] rolling-ball BG subtract [lazy, rolling_ball_large.py]
-    → Gaussian smooth (sigma)             [eager, small array]
-    → threshold (value)                   [eager]
-    → remove_small_holes (area_threshold) [eager]
-    → remove_small_objects (min_size)     [eager]
-    → channel mask (napari Labels layer)
+  OME-TIFF (palom OmePyramidReader)
+    → [optional] channel subset (--channels / --channel-names CLI args)
+    → [optional] rolling-ball BG subtract
+        Preview : lazy dask array (on-demand, no disk write)
+        Cache   : computed to zarr on disk in a background thread
+    → downsample to target pixel size (background thread)
+        lazy_resize: map_blocks with chunks aligned to INTER_AREA boundaries
+        stored as numpy array (_preview_raw) for fast re-blur
+    → Gaussian smooth (sigma, cv2.GaussianBlur)
+        applied to _preview_raw; debounced live update
+    → threshold via napari contrast_limits lower bound
+        live readout in integer or float depending on dtype
+    → finalize (background thread):
+        mask = preview_data > threshold
+        remove_small_holes  (area ≤ N µm²)
+        remove_small_objects (area < N µm²)
+    → Labels layer with unique label value (distinct napari color per layer)
 
 Combine masks:
-  [mask_A] op [mask_B] op [mask_C] ...   [left-to-right, configurable ops]
+  [mask_A] op [mask_B] op [mask_C] ...  (left-to-right, configurable ops)
+    → computed in background thread
     → [optional] remove_small_holes / remove_small_objects
-    → final mask (napari Labels layer)
+    → Labels layer
 
-Record parameters → YAML/JSON sidecar
+Record parameters → JSON sidecar
+  filename mirrors mask file with dots→underscores + "-params.json"
+  e.g. mask.ome.tif → mask_ome_tif-params.json
+       mask.geojson → mask_geojson-params.json
 
-Write final mask to disk
-  → GeoJSON polygon  (QuPath-compatible)
-  or
-  → binary OME-TIFF / Zarr
+Write final mask to disk:
+  → GeoJSON polygon    (QuPath-compatible; coordinates scaled by pixel_size)
+  → GeoJSON (zip)      (deflate-compressed .geojson.zip)
+  → OME-TIFF           (palom pyramidal, is_mask=True, zlib, .ome.tif)
+  → Zarr               (binary bool, pixel_size stored in attrs)
+
+  File picker dialog triggers save immediately.
+  "Save mask and params" button re-saves to the current path.
+  napari show_info notification on completion.
 ```
 
 ---
 
-## Key decisions
+## Dock widget layout (5 panels)
+
+### Panel 1 — BG subtraction (RollingBallWidget)
+| Control | Widget |
+|---|---|
+| Image layer | `ComboBox` (auto-tracks selection) |
+| Ball radius | `DoubleSpinBox` (µm) |
+| [Preview] | Lazy layer, instant |
+| [Cache] | Background thread → zarr on disk |
+| Cache dir | `LineEdit` + browse + clear |
+
+### Panel 2 — Threshold (ThresholdWidget)
+| Control | Widget |
+|---|---|
+| Image layer | `ComboBox` |
+| Source px size | `DoubleSpinBox` (µm/px, auto-populated from layer) |
+| Mask px size | `DoubleSpinBox` (µm/px) |
+| Gaussian sigma | `DoubleSpinBox` (px, debounced live re-blur) |
+| Invert colormap | `CheckBox` (brightfield mode) |
+| [Add Preview Layer] | Downsample in background thread; adds `pre-{name}` layer |
+| Threshold readout | `QLabel` — tracks contrast_limits[0] of preview layer |
+| Fill holes ≤ | `SpinBox` (µm²) |
+| Remove objects < | `SpinBox` (µm², default 0) |
+| [Finalize Mask] | Background thread → adds `fin-{name}` Labels layer |
+
+### Panel 3 — Combine masks (CombineWidget)
+| Control | Widget |
+|---|---|
+| Mask 1 | `ComboBox` (all Labels layers) |
+| [op ▾] Mask N | `ComboBox` op + `ComboBox` layer (filtered to seed shape) + [−] |
+| [+ Add row] | Appends a row; non-seed dropdowns show only shape-matched layers |
+| Fill holes ≤ | `SpinBox` (µm²) |
+| Remove objects < | `SpinBox` (µm²) |
+| Output name | `LineEdit` |
+| [Finalize combined mask] | Background thread → Labels layer |
+
+Seed mask change resets all subsequent rows for a clean state.
+
+### Panel 4 — Export (ExportWidget)
+| Control | Widget |
+|---|---|
+| Mask layer | `ComboBox` (Labels layers) |
+| Pixel size | `DoubleSpinBox` — auto-populated from layer; editable only for GeoJSON |
+| Format | `ComboBox`: GeoJSON / GeoJSON (zip) / Zarr / TIFF |
+| Output path | `LineEdit` + [browse + save] |
+| [Save mask and params] | Re-save to current path without file picker |
+
+### Panel 5 — Mask info (MaskInfoWidget)
+Displays `mask_params` metadata for the currently selected Labels layer as a
+key/value grid. Updated on selection change and layer insertion.
+
+---
+
+## Key design decisions
 
 ### 1. Do not use pre-built OME-TIFF pyramids for downsampling
 
-Pre-built pyramid levels in OME-TIFF files are commonly generated with bilinear or
-nearest-neighbor interpolation (OpenSlide, common converters), which introduces aliasing.
-For quantitative fluorescence thresholding, aliasing can suppress thin bright structures
-(capillaries, ducts) and create phantom signal near Nyquist.
+Pre-built pyramid levels are commonly generated with bilinear or nearest-neighbor
+interpolation, which introduces aliasing. For quantitative fluorescence thresholding,
+aliasing can suppress thin bright structures (capillaries, ducts).
 
-**Decision:** always downsample from the full-resolution layer using `cv2.INTER_AREA`,
-which is the correct anti-aliasing method for downscaling.
+**Decision:** always downsample from full resolution using `cv2.INTER_AREA`.
 
-### 2. Lazy resize via `map_overlap`, not `map_blocks`
+### 2. Lazy resize via `map_blocks` with aligned chunk sizing
 
-For non-integer scale factors, `cv2.INTER_AREA` has a kernel support of `ceil(1/s)` input
-pixels. Naive `map_blocks` produces 1-pixel seam artifacts at chunk boundaries.
+For non-integer scale factors, `cv2.INTER_AREA` has fractional kernel boundaries at
+chunk edges, causing seam artifacts with naive `map_blocks`.
 
-**Decision:** use `da.map_overlap` with:
-- `depth = ceil(1 / scale)` input pixels on each side
-- `trim=False` — shape changes so dask cannot auto-trim
-- manual output trim inside the block function: `d = max(1, round(depth * scale))`
+**Solution** (in `mask_tool/resize.py`): express scale as `p/q` (lowest terms via
+`Fraction.limit_denominator(1000)`). Align chunk sizes to multiples of `q`. At this
+alignment, INTER_AREA kernel boundaries fall exactly on chunk edges — each chunk's
+output is pixel-identical to the same region in a full-image resize. No overlap
+padding is needed; no seams.
 
-For typical mIF scales (~0.325 µm → 10 µm, scale ≈ 0.033), `depth ≈ 31` input pixels and
-`d = 1` output pixel. Overhead is negligible.
+Guard: `cv2.resize` errors when output dimension rounds to 0. Remainder chunks
+smaller than `ceil(0.5/scale)` are absorbed into the preceding chunk.
 
-For integer scale factors, `map_blocks` with chunk sizes divisible by `sf` is exact and
-slightly simpler, but `map_overlap` is used uniformly for correctness.
+The original design specified `map_overlap`; the aligned `map_blocks` approach is
+simpler, cheaper, and produces identical results.
 
-*Practical note:* at 20–30× downscale, downstream Gaussian smoothing buries the 1-pixel
-seam anyway. But implementing it properly costs little extra.
+### 3. Threshold via napari contrast limits
 
-### 3. Cache the downsampled image as in-memory zarr
+No custom slider widget. Instead:
+- The preview Image layer uses a threshold colormap (black→white or inverted).
+- The lower contrast limit acts as the threshold value.
+- A `contrast_limits` event listener updates the threshold readout label.
+- The readout is cast to `int` when the preview data has an integer dtype, keeping
+  the displayed and logged values in sync.
 
-After the resize (and optional BG subtraction) is computed once, store it as a zarr array.
-This cache is shared across:
-- rolling-ball background estimation (needs random-access blocks)
-- mask pipeline (smooth → threshold → cleanup)
-- napari visualization
+### 4. Morphological operations — pure OpenCV
 
-A minimal 2-level pyramid is built from the cache for napari multiscale display:
-```python
-napari_pyramid = [cache, cache[::2, ::2]]
-viewer.add_image(napari_pyramid, multiscale=True)
-```
+`remove_small_objects` and `remove_small_holes` in `mask_tool/pipeline.py` use
+`cv2.connectedComponentsWithStats` instead of scikit-image. This eliminates the
+scikit-image dependency for mask cleanup and keeps the operations consistent across
+the single-channel and combine paths.
 
-**Options (expose in UI):**
-- In-memory zarr (default): fast, gone on session exit
-- Temp-file zarr: survives kernel restart, useful when BG subtraction is slow
+### 5. Background threading
 
-### 4. Threshold widget
+All heavy compute runs in napari `@thread_worker` background threads:
+- Rolling ball cache computation
+- Image downsampling (lazy_resize → .compute())
+- Mask finalization (threshold + hole fill + object removal)
+- Mask combination
 
-`magicgui.widgets.FloatSlider(readout=True, tracking=True)` already provides a
-slider + editable spinbox combination. The readout is a bidirectional `QDoubleSpinBox`
-(source: `magicgui/backends/_qtpy/widgets.py`). `tracking=True` enables live preview
-as the slider is dragged.
+Buttons are disabled for the duration and re-enabled on completion or error.
 
-No custom widget needed.
+### 6. Rolling-ball background subtraction
 
-### 5. Multi-mask logical expression: dynamic row builder
+Implemented in `mask_tool/rolling_ball.py`, mirroring imagec's shrink→roll→enlarge
+strategy. Min-pools by a shrink factor (sf = 1/2/4/8 depending on radius), runs
+skimage rolling ball at the reduced scale, bilinear-upsamples the estimated
+background, then subtracts.
 
-Supports 2+ masks with a dynamic list of `(op, layer)` rows evaluated left-to-right:
+Thread allocation is tuned per regime: for sf ≥ 2 the shrunk image is tiny, so
+OpenMP overhead dominates — all cores go to dask parallelism and OpenMP is
+disabled per block. For sf = 1 cores are split evenly between dask and OpenMP.
 
-```
-[mask: CK         ▼]
-[AND ▼] [mask: ECAD     ▼]  [−]
-[OR  ▼] [mask: CD31     ▼]  [−]
-[+ add layer]
-```
+### 7. Unique label values for distinct colors
 
-Available ops: `AND`, `OR`, `AND NOT`, `OR NOT`, `XOR`
+napari colors Labels layers by label value: value 1 always maps to the same color.
+`_next_label(viewer)` returns the smallest positive integer not already used as the
+max value in any existing Labels layer, so each finalized mask gets a distinct color
+without manual bookkeeping.
 
-Serialization:
-```json
-[
-  {"layer": "CK"},
-  {"op": "AND", "layer": "ECAD"},
-  {"op": "OR",  "layer": "CD31"}
-]
-```
+### 8. Combine resolution safety
 
-Parenthesized grouping (`(A | B) & ~C`) deferred until actually needed. If required later,
-a text expression input can be added alongside the builder as an override.
+The seed mask (Mask 1) defines the coordinate frame. Non-seed dropdowns are filtered
+by `data.shape` to match the seed. Changing Mask 1 resets all subsequent rows to
+prevent stale cross-resolution pairings.
 
-### 6. No napari plugin framework needed
+### 9. Export pixel size handling
 
-Existing napari plugin ecosystems (napari-assistant, napari-workflows) don't cover the full
-pipeline (BG subtraction + multi-channel logical ops + GeoJSON export) and have unclear dask
-support. Custom `magicgui` dock widgets attached from a launcher script are sufficient and
-allow direct reuse of existing code (`rolling_ball_large.py`, cleanup functions).
-
-### 7. napari-mcp
-
-`napari-mcp` (early-stage, napari team) exposes a running napari viewer over the Model
-Context Protocol — useful for agent-driven interactive exploration (add/remove layers, run
-scripts, read layer state). Not a pipeline builder. Worth installing for iterating on
-thresholds via conversation rather than sliders.
-
----
-
-## Widget layout (3 dock panels)
-
-### Panel 1 — Channel mask builder
-| Control | Widget |
-|---|---|
-| Image layer | `ComboBox` (napari image layers) |
-| Channel index | `SpinBox` |
-| Target pixel size (µm) | `FloatSpinBox` |
-| BG subtract | `CheckBox` |
-| Rolling-ball radius (px) | `FloatSpinBox` (enabled when BG subtract is on) |
-| Gaussian sigma | `FloatSlider(readout=True)` |
-| Threshold | `FloatSlider(readout=True, tracking=True)` |
-| Remove holes (area px) | `SpinBox` |
-| Remove objects (area px) | `SpinBox` |
-| Output layer name | `LineEdit` |
-| [Build mask] | `PushButton` |
-| [Clear cache] | `PushButton` |
-
-### Panel 2 — Combine masks
-| Control | Widget |
-|---|---|
-| Dynamic row list | `(ComboBox op, ComboBox layer, PushButton −)` × N |
-| [+ Add layer] | `PushButton` |
-| Remove holes | `SpinBox` |
-| Remove objects | `SpinBox` |
-| Output layer name | `LineEdit` |
-| [Compute] | `PushButton` |
-
-### Panel 3 — Export
-| Control | Widget |
-|---|---|
-| Mask layer | `ComboBox` |
-| Format | `RadioButtons`: GeoJSON / Zarr / OME-TIFF |
-| Output path | `FileEdit` |
-| [Save + log params] | `PushButton` |
+Pixel size is pulled from `layer.scale[-1]` when the mask layer is selected:
+- **GeoJSON**: pixel_size is a load-bearing coordinate transform
+  (`shapely.affinity.scale`); user may adjust before saving.
+- **Zarr / OME-TIFF**: pixel_size is metadata only (zarr attrs / OME-XML); locked
+  to the layer value.
 
 ---
 
@@ -182,49 +202,56 @@ thresholds via conversation rather than sliders.
 
 ```json
 {
-  "file": "...",
-  "timestamp": "2026-05-14T...",
-  "channel_masks": [
-    {
-      "layer_name": "CK",
-      "channel_idx": 18,
-      "target_px_size": 10.0,
-      "bg_subtract": true,
-      "rolling_ball_radius": 50,
-      "gaussian_sigma": 1.0,
-      "threshold": 400,
-      "remove_holes_area": 10,
-      "remove_objects_area": 10
+  "timestamp": "2026-05-15T...",
+  "output_layer": "fin-CD31",
+  "output_file": "/path/to/mask.ome.tif",
+  "threshold_masks": {
+    "fin-CD31": {
+      "type": "threshold",
+      "source_layer": "CD31",
+      "preview_layer": "pre-CD31",
+      "px_size_src_um": 0.65,
+      "target_px_size_um": 4.0,
+      "gaussian_sigma_px": 1.0,
+      "threshold": 272,
+      "hole_threshold_um2": 1000,
+      "obj_threshold_um2": 300,
+      "invert": false
     }
-  ],
-  "combine": [
-    {"layer": "CK"},
-    {"op": "AND", "layer": "ECAD"}
-  ],
-  "combine_cleanup": {
-    "remove_holes_area": 10,
-    "remove_objects_area": 10
   },
-  "output_format": "geojson"
+  "combine": {
+    "steps": [
+      {"layer": "fin-CD31"},
+      {"op": "AND", "layer": "fin-SMA"}
+    ],
+    "hole_threshold": 1000,
+    "obj_threshold": 0
+  }
 }
 ```
 
 ---
 
-## Existing code to reuse
+## File layout
 
-| File | Reused as |
-|---|---|
-| `rolling_ball_large.py` | BG subtraction backend (already lazy) |
-| `01-tumor_mask_gen.py` | `remove_small_objects`, `remove_small_holes`, `mask_to_polygon` |
-| `01-tumor_mask_gen.py` | GeoJSON export logic |
+```
+mask_tool/
+  __init__.py
+  pipeline.py      — remove_small_objects, remove_small_holes, combine_masks, CombineParams
+  resize.py        — lazy_resize (map_blocks, aligned chunk sizing)
+  rolling_ball.py  — subtract_background, subtract_background_lazy, rolling_ball_background
+  export.py        — export_geojson, export_zarr, export_tiff, save_params, mask_to_polygon
+  widgets.py       — RollingBallWidget, ThresholdWidget, CombineWidget, ExportWidget, MaskInfoWidget
+launch.py          — CLI entry point (--channels, --channel-names)
+```
 
 ---
 
-## Open questions / deferred
+## Resolved / closed questions
 
-- Whether to support OME-Zarr inputs in addition to OME-TIFF (straightforward with
-  `da.from_zarr`, but needs testing)
-- Exact output chunk spec for `map_overlap` when shape changes — needs careful dask
-  `chunks=` declaration
-- napari-mcp installation and wiring
+- **OME-Zarr input**: not implemented; palom handles OME-TIFF well and that covers all
+  current samples.
+- **map_overlap chunk shape**: resolved by switching to aligned map_blocks instead.
+- **napari-mcp**: not yet installed; deferred.
+- **Threshold widget**: contrast_limits approach is more idiomatic in napari than a
+  separate slider and requires no custom widget.
