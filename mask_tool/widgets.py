@@ -945,12 +945,20 @@ class ExportWidget(QWidget):
         export_btn.clicked.connect(self._on_export)
         root.addWidget(export_btn)
 
+        self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
         viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
         viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
         self._refresh_layers()
+        self._px_size.setEnabled(self._format_combo.currentText().startswith("GeoJSON"))
 
     def _refresh_layers(self):
         _refresh_combo(self._layer_combo, _labels_layers(self._viewer))
+        self._on_layer_changed(self._layer_combo.currentText())
+
+    def _on_layer_changed(self, name: str):
+        if name and name in self._viewer.layers:
+            px = float(self._viewer.layers[name].scale[-1])
+            self._px_size.setValue(px)
 
     def _on_format_changed(self, fmt: str):
         path = pathlib.Path(self._out_path.text())
@@ -961,6 +969,7 @@ class ExportWidget(QWidget):
             "TIFF": ".tiff",
         }
         self._out_path.setText(str(path.with_suffix(ext_map.get(fmt, ".geojson"))))
+        self._px_size.setEnabled(fmt.startswith("GeoJSON"))
 
     def _browse_output(self):
         path, _ = QFileDialog.getSaveFileName(
