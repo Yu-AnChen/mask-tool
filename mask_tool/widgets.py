@@ -963,8 +963,8 @@ class ExportWidget(QWidget):
         self._layer_combo.setFixedHeight(_FIELD_H)
         form.addRow("Mask layer:", self._layer_combo)
 
-        self._px_size = _dbl_spin(10.0, 0.001, 1000.0, 2, "µm/px")
-        form.addRow("Pixel size:", self._px_size)
+        self._px_size = _dbl_spin(1.0, 0.0001, 1000.0, 4, "µm/px")
+        form.addRow("Source px size:", self._px_size)
 
         self._format_combo = QComboBox()
         self._format_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1005,8 +1005,13 @@ class ExportWidget(QWidget):
 
     def _on_layer_changed(self, name: str):
         if name and name in self._viewer.layers:
-            px = float(self._viewer.layers[name].scale[-1])
-            self._px_size.setValue(px)
+            layer = self._viewer.layers[name]
+            params = layer.metadata.get("mask_params", {})
+            src_px = params.get("px_size_src_um")
+            if src_px is not None:
+                self._px_size.setValue(float(src_px))
+            else:
+                self._px_size.setValue(1.0)
 
     def _on_format_changed(self, fmt: str):
         path = pathlib.Path(self._out_path.text())
@@ -1033,21 +1038,23 @@ class ExportWidget(QWidget):
         if not layer_name or layer_name not in self._viewer.layers:
             return
 
-        mask = np.asarray(self._viewer.layers[layer_name].data).astype(bool)
-        px = self._px_size.value()
+        layer = self._viewer.layers[layer_name]
+        mask = np.asarray(layer.data).astype(bool)
+        mask_px = float(layer.scale[-1])
+        src_px = self._px_size.value()
         out = pathlib.Path(self._out_path.text())
         fmt = self._format_combo.currentText()
 
         if fmt == "GeoJSON":
-            result_path = export_geojson(mask, px, _change_suffix(out, ".geojson"))
+            result_path = export_geojson(mask, mask_px / src_px, _change_suffix(out, ".geojson"))
         elif fmt == "GeoJSON (zip)":
-            result_path = export_geojson(mask, px, _change_suffix(out, ".geojson"), compress=True)
+            result_path = export_geojson(mask, mask_px / src_px, _change_suffix(out, ".geojson"), compress=True)
         elif fmt == "Zarr":
             result_path = _change_suffix(out, ".zarr")
-            export_zarr(mask, result_path, pixel_size=px)
+            export_zarr(mask, result_path, pixel_size=mask_px)
         else:
             result_path = _change_suffix(out, ".ome.tif")
-            export_tiff(mask, result_path, pixel_size=px)
+            export_tiff(mask, result_path, pixel_size=mask_px)
 
         params: dict = {"output_layer": layer_name, "output_file": str(result_path)}
         if self._threshold_widget:
