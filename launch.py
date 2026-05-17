@@ -110,6 +110,10 @@ def main(argv: list[str] | None = None) -> None:
         "--id", metavar="ID",
         help="Sample identifier; exported files default to {id}-mask.geojson / {id}-mask.ome.tif",
     )
+    parser.add_argument(
+        "--params", metavar="FILE",
+        help="Path to a .params.json from a previous run; pre-fills widget controls for a new image",
+    )
     args = parser.parse_args(argv)
 
     if args.channels is not None and args.channel_names is not None:
@@ -147,6 +151,19 @@ def main(argv: list[str] | None = None) -> None:
     viewer.window.add_dock_widget(comb_widget, area="right", name="Combine masks")
     viewer.window.add_dock_widget(exp_widget,  area="right", name="Export")
     viewer.window.add_dock_widget(info_widget, area="right", name="Mask info")
+
+    if args.params:
+        import json
+        params_path = pathlib.Path(args.params)
+        if params_path.exists():
+            with open(params_path) as f:
+                params_data = json.load(f)
+            rb_widget.load_session_params(params_data)
+            thr_widget.load_session_params(params_data)
+            comb_widget.load_session_params(params_data)
+            print(f"Loaded params: {params_path}")
+        else:
+            print(f"Warning: --params file not found: {params_path}")
 
     if args.image:
         print(f"  cache dir  : {rb_widget._cache_dir}")

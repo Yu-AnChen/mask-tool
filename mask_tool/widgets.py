@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import tempfile
 
 import cv2
@@ -106,12 +107,17 @@ def _params_to_rows(params: dict) -> list[tuple[str, str]]:
     t = params.get("type", "threshold")
     if t == "threshold":
         rows: list[tuple[str, str]] = [
-            ("Source layer",    params["source_layer"]),
-            ("Source px size",  f"{params['px_size_src_um']} µm/px"),
-            ("Mask px size",    f"{params['target_px_size_um']} µm/px"),
-            ("Gaussian sigma",  f"{params['gaussian_sigma_px']} px"),
-            ("Threshold",       f"{params['threshold']:.1f}"),
-            ("Fill holes ≤",    f"{params['hole_threshold_um2']} µm²"),
+            ("Source layer", params["source_layer"]),
+        ]
+        if "rolling_ball" in params:
+            rb = params["rolling_ball"]
+            rows.append(("BG subtract", f"radius {rb['radius_um']:.0f} µm"))
+        rows += [
+            ("Source px size",   f"{params['px_size_src_um']} µm/px"),
+            ("Mask px size",     f"{params['target_px_size_um']} µm/px"),
+            ("Gaussian sigma",   f"{params['gaussian_sigma_px']} px"),
+            ("Threshold",        f"{params['threshold']:.1f}"),
+            ("Fill holes ≤",     f"{params['hole_threshold_um2']} µm²"),
             ("Remove objects <", f"{params['obj_threshold_um2']} µm²"),
         ]
         if params.get("invert"):
@@ -211,6 +217,13 @@ def _strip_mask_prefix(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+_RB_SUFFIX_RE = re.compile(r"-rb-[\d.]+µm$")
+
+
+def _strip_rb_suffix(name: str) -> str:
+    return _RB_SUFFIX_RE.sub("", name)
 
 
 def _pre_name(src_name: str) -> str:
@@ -368,15 +381,19 @@ class RollingBallWidget(QWidget):
         out_name = f"{name}-rb-{radius_µm:.0f}µm"
         return layer, data, radius_px, out_name
 
-    def _add_or_replace_image(self, arr, name, scale, translate, **kwargs):
+    def _add_or_replace_image(self, arr, name, scale, translate, rb_params=None, **kwargs):
         if name in self._viewer.layers:
             lyr = self._viewer.layers[name]
             lyr.data = arr
             lyr.scale = scale
             lyr.translate = translate
+            if rb_params is not None:
+                lyr.metadata["rb_params"] = rb_params
             # kwargs (colormap, contrast_limits) only applied on first creation
         else:
-            self._viewer.add_image(arr, name=name, scale=scale, translate=translate, **kwargs)
+            lyr = self._viewer.add_image(arr, name=name, scale=scale, translate=translate, **kwargs)
+            if rb_params is not None:
+                lyr.metadata["rb_params"] = rb_params
 
     def _on_preview(self):
         inputs = self._current_inputs()
@@ -384,10 +401,12 @@ class RollingBallWidget(QWidget):
             return
         layer, data, radius_px, out_name = inputs
         lazy_result = subtract_background_lazy(data, radius=radius_px)
+        rb_params = {"source_layer": layer.name, "radius_um": self._radius_spin.value(), "cached": False}
         self._add_or_replace_image(
             lazy_result, out_name,
             scale=tuple(layer.scale[-2:]),
             translate=tuple(layer.translate[-2:]),
+            rb_params=rb_params,
             colormap=layer.colormap,
             contrast_limits=layer.contrast_limits,
         )
@@ -402,6 +421,8 @@ class RollingBallWidget(QWidget):
         translate = tuple(layer.translate[-2:])
         colormap = layer.colormap
         contrast_limits = layer.contrast_limits
+        src_name = layer.name
+        radius_µm = self._radius_spin.value()
 
         self._cache_btn.setEnabled(False)
         self._preview_btn.setEnabled(False)
@@ -410,16 +431,27 @@ class RollingBallWidget(QWidget):
                                       num_workers=os.cpu_count() or 1)
         worker.returned.connect(
             lambda arr: self._on_cache_done(arr, out_name, scale, translate,
-                                            colormap, contrast_limits)
+                                            colormap, contrast_limits, src_name, radius_µm)
         )
         worker.errored.connect(self._on_worker_error)
         worker.start()
 
-    def _on_cache_done(self, arr, out_name, scale, translate, colormap, contrast_limits):
+    def _on_cache_done(self, arr, out_name, scale, translate, colormap, contrast_limits, src_name, radius_µm):
         self._cache_btn.setEnabled(True)
         self._preview_btn.setEnabled(True)
+        rb_params = {"source_layer": src_name, "radius_um": radius_µm, "cached": True}
         self._add_or_replace_image(da.from_zarr(arr), out_name, scale, translate,
+                                   rb_params=rb_params,
                                    colormap=colormap, contrast_limits=contrast_limits)
+
+    def load_session_params(self, params_data: dict) -> None:
+        radii = [
+            entry["rolling_ball"]["radius_um"]
+            for entry in params_data.get("threshold_masks", {}).values()
+            if "rolling_ball" in entry
+        ]
+        if radii:
+            self._radius_spin.setValue(radii[0])
 
     def _on_worker_error(self, exc):
         self._cache_btn.setEnabled(True)
@@ -458,6 +490,7 @@ class ThresholdWidget(QWidget):
         self._preview_data: np.ndarray | None = None  # blurred, used for threshold
         self._src_layer_name: str | None = None
         self._params_log: dict[str, dict] = {}
+        self._loaded_params: dict[str, dict] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -531,6 +564,10 @@ class ThresholdWidget(QWidget):
     def _on_layer_changed(self, name: str):
         if name and name in self._viewer.layers:
             self._px_src.setValue(round(float(self._viewer.layers[name].scale[-1]), 6))
+        if name:
+            entry = self._find_loaded_params(name)
+            if entry:
+                self._apply_loaded_params(entry)
 
     def _on_layer_removed(self, event):
         if self._preview_layer is not None and event.value is self._preview_layer:
@@ -671,6 +708,9 @@ class ThresholdWidget(QWidget):
             "obj_threshold_um2": self._objs.value(),
             "invert": self._invert.isChecked(),
         }
+        rb = src_layer.metadata.get("rb_params")
+        if rb:
+            mask_params["rolling_ball"] = rb
 
         self._finalize_btn.setEnabled(False)
         worker = _finalize_mask_worker(self._preview_data.copy(), threshold, hole_px, obj_px)
@@ -700,6 +740,35 @@ class ThresholdWidget(QWidget):
 
     def get_params(self) -> dict:
         return dict(self._params_log)
+
+    def load_session_params(self, params_data: dict) -> None:
+        self._loaded_params = {
+            name: entry
+            for name, entry in params_data.get("threshold_masks", {}).items()
+            if entry.get("type") == "threshold"
+        }
+        # Trigger auto-fill for whichever layer is currently selected
+        self._on_layer_changed(self._layer_combo.currentText())
+
+    def _find_loaded_params(self, name: str) -> dict | None:
+        if not self._loaded_params:
+            return None
+        for entry in self._loaded_params.values():
+            if entry.get("source_layer") == name:
+                return entry
+        base = _strip_rb_suffix(name)
+        matches = [
+            e for e in self._loaded_params.values()
+            if _strip_rb_suffix(e.get("source_layer", "")) == base
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _apply_loaded_params(self, entry: dict) -> None:
+        self._px_tgt.setValue(entry["target_px_size_um"])
+        self._sigma.setValue(entry["gaussian_sigma_px"])
+        self._holes.setValue(entry["hole_threshold_um2"])
+        self._objs.setValue(entry["obj_threshold_um2"])
+        self._invert.setChecked(bool(entry.get("invert", False)))
 
 
 # ── CombineWidget ─────────────────────────────────────────────────────────────
@@ -805,6 +874,12 @@ class CombineWidget(QWidget):
         add_btn = QPushButton("+ Add row")
         add_btn.clicked.connect(self._add_row)
         root.addWidget(add_btn)
+
+        self._hint_label = QLabel()
+        self._hint_label.setWordWrap(True)
+        self._hint_label.setStyleSheet("color: gray; font-style: italic;")
+        self._hint_label.setVisible(False)
+        root.addWidget(self._hint_label)
 
         root.addWidget(_separator())
 
@@ -931,6 +1006,31 @@ class CombineWidget(QWidget):
 
     def get_params(self) -> dict | None:
         return self._last_params.to_dict() if self._last_params else None
+
+    def load_session_params(self, params_data: dict) -> None:
+        combine = params_data.get("combine")
+        if not combine:
+            return
+        steps = combine.get("steps", [])
+        if len(steps) < 2:
+            return
+        self._holes.setValue(combine.get("hole_threshold", 0))
+        self._objs.setValue(combine.get("obj_threshold", 0))
+        # Rebuild non-first rows with correct ops from saved session
+        for row in self._rows[1:]:
+            self._rows_layout.removeWidget(row)
+            row.deleteLater()
+        self._rows = self._rows[:1]
+        for step in steps[1:]:
+            self._add_row()
+            self._rows[-1].op_combo.setCurrentText(step.get("op", "AND"))
+        # Hint showing previous layer expression
+        parts = [steps[0]["layer"]]
+        for step in steps[1:]:
+            parts.append(step["op"])
+            parts.append(step["layer"])
+        self._hint_label.setText("Previous: " + " ".join(parts))
+        self._hint_label.setVisible(True)
 
 
 # ── ExportWidget ──────────────────────────────────────────────────────────────
