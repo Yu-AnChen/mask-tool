@@ -21,6 +21,7 @@ from napari.qt import thread_worker
 from napari.utils import Colormap
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -491,6 +492,7 @@ class ThresholdWidget(QWidget):
         self._src_layer_name: str | None = None
         self._params_log: dict[str, dict] = {}
         self._loaded_params: dict[str, dict] = {}
+        self._px_size_override: float | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -507,6 +509,9 @@ class ThresholdWidget(QWidget):
         form.addRow("Image layer:", self._layer_combo)
 
         self._px_src = _dbl_spin(0.325, 0.001, 100.0, 3, "µm/px")
+        self._px_src.setReadOnly(True)
+        self._px_src.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._px_src.setToolTip("Auto-populated from layer metadata. Override with --px-size at launch.")
         form.addRow("Source px size:", self._px_src)
 
         self._px_tgt = _dbl_spin(10.0, 0.1, 1000.0, 2, "µm/px")
@@ -563,7 +568,10 @@ class ThresholdWidget(QWidget):
 
     def _on_layer_changed(self, name: str):
         if name and name in self._viewer.layers:
-            self._px_src.setValue(round(float(self._viewer.layers[name].scale[-1]), 6))
+            px = (self._px_size_override
+                  if self._px_size_override is not None
+                  else round(float(self._viewer.layers[name].scale[-1]), 6))
+            self._px_src.setValue(px)
         if name:
             entry = self._find_loaded_params(name)
             if entry:
@@ -769,6 +777,10 @@ class ThresholdWidget(QWidget):
         self._holes.setValue(entry["hole_threshold_um2"])
         self._objs.setValue(entry["obj_threshold_um2"])
         self._invert.setChecked(bool(entry.get("invert", False)))
+
+    def set_px_size_override(self, px_size: float) -> None:
+        self._px_size_override = px_size
+        self._on_layer_changed(self._layer_combo.currentText())
 
 
 # ── CombineWidget ─────────────────────────────────────────────────────────────

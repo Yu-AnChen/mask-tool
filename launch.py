@@ -114,6 +114,10 @@ def main(argv: list[str] | None = None) -> None:
         "--params", metavar="FILE",
         help="Path to a .params.json from a previous run; pre-fills widget controls for a new image",
     )
+    parser.add_argument(
+        "--px-size", type=float, metavar="UM",
+        help="Override source pixel size (µm/px); use when OME metadata contains wrong pixel size",
+    )
     args = parser.parse_args(argv)
 
     if args.channels is not None and args.channel_names is not None:
@@ -147,10 +151,14 @@ def main(argv: list[str] | None = None) -> None:
     info_widget = MaskInfoWidget(viewer)
 
     viewer.window.add_dock_widget(rb_widget,   area="right", name="BG subtraction")
-    viewer.window.add_dock_widget(thr_widget,  area="right", name="Threshold")
+    viewer.window.add_dock_widget(thr_widget,  area="right", name="Threshold", tabify=True)
     viewer.window.add_dock_widget(comb_widget, area="right", name="Combine masks")
-    viewer.window.add_dock_widget(exp_widget,  area="right", name="Export")
+    viewer.window.add_dock_widget(exp_widget,  area="right", name="Export", tabify=True)
     viewer.window.add_dock_widget(info_widget, area="right", name="Mask info")
+
+    if args.px_size:
+        thr_widget.set_px_size_override(args.px_size)
+        print(f"  px override: {args.px_size} µm (--px-size)")
 
     if args.params:
         import json
