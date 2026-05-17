@@ -1066,7 +1066,7 @@ class ExportWidget(QWidget):
         form.addRow("Mask layer:", self._layer_combo)
 
         self._px_size = _dbl_spin(1.0, 0.0001, 1000.0, 4, "µm/px")
-        form.addRow("Source px size:", self._px_size)
+        form.addRow("Export px size:", self._px_size)
 
         self._format_combo = QComboBox()
         self._format_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1106,14 +1106,15 @@ class ExportWidget(QWidget):
         self._on_layer_changed(self._layer_combo.currentText())
 
     def _on_layer_changed(self, name: str):
-        if name and name in self._viewer.layers:
-            layer = self._viewer.layers[name]
+        if not name or name not in self._viewer.layers:
+            return
+        layer = self._viewer.layers[name]
+        if self._format_combo.currentText().startswith("GeoJSON"):
             params = layer.metadata.get("mask_params", {})
             src_px = params.get("px_size_src_um")
-            if src_px is not None:
-                self._px_size.setValue(float(src_px))
-            else:
-                self._px_size.setValue(1.0)
+            self._px_size.setValue(float(src_px) if src_px is not None else 1.0)
+        else:
+            self._px_size.setValue(round(float(layer.scale[-1]), 6))
 
     def _on_format_changed(self, fmt: str):
         path = pathlib.Path(self._out_path.text())
@@ -1125,6 +1126,7 @@ class ExportWidget(QWidget):
         }
         self._out_path.setText(str(_change_suffix(path, ext_map.get(fmt, ".geojson"))))
         self._px_size.setEnabled(fmt.startswith("GeoJSON"))
+        self._on_layer_changed(self._layer_combo.currentText())
 
     def _browse_output(self):
         path, _ = QFileDialog.getSaveFileName(
