@@ -21,13 +21,11 @@ def remove_small_objects(
     binary = (ar > 0).astype(np.uint8) * 255
     cv2_conn = 4 if connectivity == 1 else 8
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=cv2_conn)
-    out = np.zeros_like(binary)
-    for lbl in range(1, n):
-        if stats[lbl, cv2.CC_STAT_AREA] >= min_size:
-            out[labels == lbl] = 255
+    keep = np.nonzero(stats[1:, cv2.CC_STAT_AREA] >= min_size)[0] + 1
+    out = np.isin(labels, keep)
     if ar.dtype == bool:
-        return out > 0
-    return (out > 0).astype(ar.dtype)
+        return out
+    return out.astype(ar.dtype)
 
 
 def remove_small_holes(
@@ -38,16 +36,13 @@ def remove_small_holes(
     cv2_conn = 4 if connectivity == 1 else 8
     n, labels, stats, _ = cv2.connectedComponentsWithStats(inverted, connectivity=cv2_conn)
 
-    border = set()
-    border.update(labels[0, :].tolist())
-    border.update(labels[-1, :].tolist())
-    border.update(labels[:, 0].tolist())
-    border.update(labels[:, -1].tolist())
-
+    border_labels = np.unique(np.concatenate([
+        labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]
+    ]))
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    fill = np.nonzero((areas <= area_threshold) & ~np.isin(np.arange(1, n), border_labels))[0] + 1
     out = binary.copy()
-    for lbl in range(1, n):
-        if lbl not in border and stats[lbl, cv2.CC_STAT_AREA] <= area_threshold:
-            out[labels == lbl] = 255
+    out[np.isin(labels, fill)] = 255
     if ar.dtype == bool:
         return out > 0
     return (out > 0).astype(ar.dtype)
