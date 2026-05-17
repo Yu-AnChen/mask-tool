@@ -1107,6 +1107,12 @@ class ExportWidget(QWidget):
         export_btn.clicked.connect(self._on_export)
         root.addWidget(export_btn)
 
+        root.addWidget(_separator())
+
+        quick_btn = QPushButton("Export GeoJSON + TIFF")
+        quick_btn.clicked.connect(self._on_quick_export)
+        root.addWidget(quick_btn)
+
         self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
         viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
         viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
@@ -1185,6 +1191,49 @@ class ExportWidget(QWidget):
         save_params(params, log_path)
         print(f"Saved: {result_path}\nParams: {log_path}")
         show_info(f"Saved {result_path.name}\n{log_path.name}")
+
+    def _on_quick_export(self):
+        from napari.utils.notifications import show_info
+        layer_name = self._layer_combo.currentText()
+        if not layer_name or layer_name not in self._viewer.layers:
+            return
+
+        layer = self._viewer.layers[layer_name]
+        mask = np.asarray(layer.data).astype(bool)
+        mask_px = float(layer.scale[-1])
+        params_meta = layer.metadata.get("mask_params", {})
+        src_px = params_meta.get("px_size_src_um") or mask_px
+
+        # derive stem from output path (strip all extensions, e.g. foo-mask.ome.tif → foo-mask)
+        out_path = pathlib.Path(self._out_path.text())
+        out_dir = out_path.parent
+        stem = out_path.name.split(".")[0]
+
+        geojson_path = out_dir / f"{stem}.geojson"
+        tiff_path = out_dir / f"{stem}.ome.tif"
+
+        result_geojson = export_geojson(mask, mask_px / src_px, geojson_path)
+        result_tiff = export_tiff(mask, tiff_path, pixel_size=mask_px)
+
+        params: dict = {
+            "output_layer": layer_name,
+            "output_files": {
+                "geojson": str(result_geojson),
+                "tiff": str(result_tiff),
+            },
+        }
+        if self._threshold_widget:
+            params["threshold_masks"] = self._threshold_widget.get_params()
+        if self._combine_widget:
+            cp = self._combine_widget.get_params()
+            if cp:
+                params["combine"] = cp
+
+        log_name = f"{stem}-params.json"
+        log_path = out_dir / log_name
+        save_params(params, log_path)
+        print(f"Quick export:\n  GeoJSON: {result_geojson}\n  TIFF: {result_tiff}\n  Params: {log_path}")
+        show_info(f"Exported {result_geojson.name} + {result_tiff.name}")
 
 
 # ── MaskInfoWidget ────────────────────────────────────────────────────────────
