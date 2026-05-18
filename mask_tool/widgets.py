@@ -323,6 +323,51 @@ def _combine_mask_worker(masks, ops, hole_px: int, obj_px: int):
     return combine_masks(masks, ops, hole_threshold=hole_px, obj_threshold=obj_px)
 
 
+@thread_worker
+def _export_worker(
+    layer_data,
+    mask_px: float,
+    src_px: float,
+    out_path: pathlib.Path,
+    fmt: str,
+    base_params: dict,
+) -> "tuple[pathlib.Path, pathlib.Path]":
+    mask = np.asarray(layer_data).astype(bool)
+    if fmt == "GeoJSON":
+        result_path = export_geojson(mask, mask_px / src_px, _change_suffix(out_path, ".geojson"))
+    elif fmt == "GeoJSON (zip)":
+        result_path = export_geojson(mask, mask_px / src_px, _change_suffix(out_path, ".geojson"), compress=True)
+    elif fmt == "Zarr":
+        result_path = _change_suffix(out_path, ".zarr")
+        export_zarr(mask, result_path, pixel_size=mask_px)
+    else:
+        result_path = _change_suffix(out_path, ".ome.tif")
+        export_tiff(mask, result_path, pixel_size=mask_px)
+    params = {**base_params, "output_file": str(result_path)}
+    log_name = result_path.name.replace(".", "_") + "-params.json"
+    log_path = result_path.parent / log_name
+    save_params(params, log_path)
+    return result_path, log_path
+
+
+@thread_worker
+def _quick_export_worker(
+    layer_data,
+    mask_px: float,
+    src_px: float,
+    geojson_path: pathlib.Path,
+    tiff_path: pathlib.Path,
+    log_path: pathlib.Path,
+    base_params: dict,
+) -> "tuple[pathlib.Path, pathlib.Path, pathlib.Path]":
+    mask = np.asarray(layer_data).astype(bool)
+    result_geojson = export_geojson(mask, mask_px / src_px, geojson_path)
+    result_tiff = export_tiff(mask, tiff_path, pixel_size=mask_px)
+    params = {**base_params, "output_files": {"geojson": str(result_geojson), "tiff": str(result_tiff)}}
+    save_params(params, log_path)
+    return result_geojson, result_tiff, log_path
+
+
 # ── RollingBallWidget ─────────────────────────────────────────────────────────
 
 
@@ -1151,15 +1196,15 @@ class ExportWidget(QWidget):
 
         root.addLayout(form)
 
-        export_btn = QPushButton("Save mask and params")
-        export_btn.clicked.connect(self._on_export)
-        root.addWidget(export_btn)
+        self._export_btn = QPushButton("Save mask and params")
+        self._export_btn.clicked.connect(self._on_export)
+        root.addWidget(self._export_btn)
 
         root.addWidget(_separator())
 
-        quick_btn = QPushButton("Export GeoJSON + TIFF")
-        quick_btn.clicked.connect(self._on_quick_export)
-        root.addWidget(quick_btn)
+        self._quick_btn = QPushButton("Export GeoJSON + TIFF")
+        self._quick_btn.clicked.connect(self._on_quick_export)
+        root.addWidget(self._quick_btn)
 
         self._layer_combo.currentTextChanged.connect(self._on_layer_changed)
         viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
@@ -1203,85 +1248,73 @@ class ExportWidget(QWidget):
             self._on_export()
 
     def _on_export(self):
-        from napari.utils.notifications import show_info
         layer_name = self._layer_combo.currentText()
         if not layer_name or layer_name not in self._viewer.layers:
             return
-
         layer = self._viewer.layers[layer_name]
-        mask = np.asarray(layer.data).astype(bool)
         mask_px = float(layer.scale[-1])
         src_px = self._px_size.value()
         out = pathlib.Path(self._out_path.text())
         fmt = self._format_combo.currentText()
-
-        if fmt == "GeoJSON":
-            result_path = export_geojson(mask, mask_px / src_px, _change_suffix(out, ".geojson"))
-        elif fmt == "GeoJSON (zip)":
-            result_path = export_geojson(mask, mask_px / src_px, _change_suffix(out, ".geojson"), compress=True)
-        elif fmt == "Zarr":
-            result_path = _change_suffix(out, ".zarr")
-            export_zarr(mask, result_path, pixel_size=mask_px)
-        else:
-            result_path = _change_suffix(out, ".ome.tif")
-            export_tiff(mask, result_path, pixel_size=mask_px)
-
-        params: dict = {"output_layer": layer_name, "output_file": str(result_path)}
-        if self._threshold_widget:
-            params["threshold_masks"] = self._threshold_widget.get_params()
-        if self._combine_widget:
-            cp = self._combine_widget.get_params()
-            if cp:
-                params["combine"] = cp
-
-        log_name = result_path.name.replace(".", "_") + "-params.json"
-        log_path = result_path.parent / log_name
-        save_params(params, log_path)
-        print(f"Saved: {result_path}\nParams: {log_path}")
-        show_info(f"Saved {result_path.name}\n{log_path.name}")
+        base_params = self._collect_params(layer_name)
+        self._set_export_enabled(False)
+        worker = _export_worker(layer.data, mask_px, src_px, out, fmt, base_params)
+        worker.returned.connect(self._on_export_done)
+        worker.errored.connect(self._on_export_error)
+        worker.start()
 
     def _on_quick_export(self):
-        from napari.utils.notifications import show_info
         layer_name = self._layer_combo.currentText()
         if not layer_name or layer_name not in self._viewer.layers:
             return
-
         layer = self._viewer.layers[layer_name]
-        mask = np.asarray(layer.data).astype(bool)
         mask_px = float(layer.scale[-1])
         params_meta = layer.metadata.get("mask_params", {})
         src_px = params_meta.get("px_size_src_um") or mask_px
-
-        # derive stem from output path (strip all extensions, e.g. foo-mask.ome.tif → foo-mask)
         out_path = pathlib.Path(self._out_path.text())
-        out_dir = out_path.parent
         stem = out_path.name.split(".")[0]
+        geojson_path = out_path.parent / f"{stem}.geojson"
+        tiff_path    = out_path.parent / f"{stem}.ome.tif"
+        log_path     = out_path.parent / f"{stem}-params.json"
+        base_params = self._collect_params(layer_name)
+        self._set_export_enabled(False)
+        worker = _quick_export_worker(layer.data, mask_px, src_px,
+                                      geojson_path, tiff_path, log_path, base_params)
+        worker.returned.connect(self._on_quick_export_done)
+        worker.errored.connect(self._on_export_error)
+        worker.start()
 
-        geojson_path = out_dir / f"{stem}.geojson"
-        tiff_path = out_dir / f"{stem}.ome.tif"
-
-        result_geojson = export_geojson(mask, mask_px / src_px, geojson_path)
-        result_tiff = export_tiff(mask, tiff_path, pixel_size=mask_px)
-
-        params: dict = {
-            "output_layer": layer_name,
-            "output_files": {
-                "geojson": str(result_geojson),
-                "tiff": str(result_tiff),
-            },
-        }
+    def _collect_params(self, layer_name: str) -> dict:
+        params: dict = {"output_layer": layer_name}
         if self._threshold_widget:
             params["threshold_masks"] = self._threshold_widget.get_params()
         if self._combine_widget:
             cp = self._combine_widget.get_params()
             if cp:
                 params["combine"] = cp
+        return params
 
-        log_name = f"{stem}-params.json"
-        log_path = out_dir / log_name
-        save_params(params, log_path)
+    def _set_export_enabled(self, enabled: bool) -> None:
+        self._export_btn.setEnabled(enabled)
+        self._quick_btn.setEnabled(enabled)
+
+    def _on_export_done(self, result: tuple) -> None:
+        from napari.utils.notifications import show_info
+        result_path, log_path = result
+        self._set_export_enabled(True)
+        print(f"Saved: {result_path}\nParams: {log_path}")
+        show_info(f"Saved {result_path.name}\n{log_path.name}")
+
+    def _on_quick_export_done(self, result: tuple) -> None:
+        from napari.utils.notifications import show_info
+        result_geojson, result_tiff, log_path = result
+        self._set_export_enabled(True)
         print(f"Quick export:\n  GeoJSON: {result_geojson}\n  TIFF: {result_tiff}\n  Params: {log_path}")
         show_info(f"Exported {result_geojson.name} + {result_tiff.name}")
+
+    def _on_export_error(self, exc: Exception) -> None:
+        self._set_export_enabled(True)
+        print(f"ExportWidget error: {exc}")
 
 
 # ── MaskInfoWidget ────────────────────────────────────────────────────────────
