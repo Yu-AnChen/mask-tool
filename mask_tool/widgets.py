@@ -248,6 +248,50 @@ def _change_suffix(path: pathlib.Path, new_suffix: str) -> pathlib.Path:
     return path.with_name(path.name.split(".")[0] + new_suffix)
 
 
+def _pick_preview_level(
+    layer: "napari.layers.Image",
+    radius_µm: float,
+    max_dim: int = 4096,
+) -> "tuple[da.Array | np.ndarray, tuple, tuple, float]":
+    """
+    Return (data_2d, scale_2d, translate_2d, radius_px) at the coarsest pyramid
+    level whose max dimension fits within max_dim.
+
+    For a WSI the rolling-ball preview layer is computed lazily on demand, so
+    using a heavily downsampled level (e.g. 3000×2500 instead of 50000×40000)
+    makes napari's first render near-instant.  The Cache button still runs on
+    level 0 (full resolution).
+    """
+    sy_0 = float(layer.scale[-2])
+    sx_0 = float(layer.scale[-1])
+    ty_0 = float(layer.translate[-2])
+    tx_0 = float(layer.translate[-1])
+    pyramid = layer.data
+
+    if isinstance(pyramid, (np.ndarray, da.Array)):
+        d = pyramid if pyramid.ndim == 2 else pyramid[0]
+        return d, (sy_0, sx_0), (ty_0, tx_0), radius_µm / sx_0
+
+    l0_h = pyramid[0].shape[-2]
+    l0_w = pyramid[0].shape[-1]
+
+    for i, level in enumerate(pyramid):
+        lh, lw = level.shape[-2], level.shape[-1]
+        if max(lh, lw) <= max_dim or i == len(pyramid) - 1:
+            d = level if level.ndim == 2 else level[0]
+            # Pixel size at this level, derived from the shape ratio to level 0
+            level_sy = sy_0 * l0_h / lh
+            level_sx = sx_0 * l0_w / lw
+            # Translate so pixel (0,0) center aligns with the same physical point
+            # as level-0 pixel (0,0) center: ty_0 + (level_sy - sy_0) / 2
+            level_ty = ty_0 + (level_sy - sy_0) / 2
+            level_tx = tx_0 + (level_sx - sx_0) / 2
+            return d, (level_sy, level_sx), (level_ty, level_tx), radius_µm / level_sx
+
+    d = pyramid[0] if pyramid[0].ndim == 2 else pyramid[0][0]
+    return d, (sy_0, sx_0), (ty_0, tx_0), radius_µm / sx_0
+
+
 # ── background thread workers ─────────────────────────────────────────────────
 
 
@@ -400,13 +444,17 @@ class RollingBallWidget(QWidget):
         inputs = self._current_inputs()
         if inputs is None:
             return
-        layer, data, radius_px, out_name = inputs
+        layer, _data, _radius_px, out_name = inputs
+        radius_µm = self._radius_spin.value()
+        # Use a downsampled pyramid level so napari's first render is fast.
+        # Cache still runs on level 0 (full resolution).
+        data, scale, translate, radius_px = _pick_preview_level(layer, radius_µm)
         lazy_result = subtract_background_lazy(data, radius=radius_px)
-        rb_params = {"source_layer": layer.name, "radius_um": self._radius_spin.value(), "cached": False}
+        rb_params = {"source_layer": layer.name, "radius_um": radius_µm, "cached": False}
         self._add_or_replace_image(
             lazy_result, out_name,
-            scale=tuple(layer.scale[-2:]),
-            translate=tuple(layer.translate[-2:]),
+            scale=scale,
+            translate=translate,
             rb_params=rb_params,
             colormap=layer.colormap,
             contrast_limits=layer.contrast_limits,
