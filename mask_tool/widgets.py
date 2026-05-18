@@ -32,6 +32,7 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -1299,22 +1300,27 @@ class ExportWidget(QWidget):
         self._quick_btn.setEnabled(enabled)
 
     def _on_export_done(self, result: tuple) -> None:
-        from napari.utils.notifications import show_info
         result_path, log_path = result
         self._set_export_enabled(True)
         print(f"Saved: {result_path}\nParams: {log_path}")
-        show_info(f"Saved {result_path.name}\n{log_path.name}")
+        QMessageBox.information(
+            self, "Export complete",
+            f"Saved:\n{result_path}\n\nParams:\n{log_path}",
+        )
 
     def _on_quick_export_done(self, result: tuple) -> None:
-        from napari.utils.notifications import show_info
         result_geojson, result_tiff, log_path = result
         self._set_export_enabled(True)
         print(f"Quick export:\n  GeoJSON: {result_geojson}\n  TIFF: {result_tiff}\n  Params: {log_path}")
-        show_info(f"Exported {result_geojson.name} + {result_tiff.name}")
+        QMessageBox.information(
+            self, "Export complete",
+            f"GeoJSON:\n{result_geojson}\n\nTIFF:\n{result_tiff}\n\nParams:\n{log_path}",
+        )
 
     def _on_export_error(self, exc: Exception) -> None:
         self._set_export_enabled(True)
         print(f"ExportWidget error: {exc}")
+        QMessageBox.critical(self, "Export failed", str(exc))
 
 
 # ── MaskInfoWidget ────────────────────────────────────────────────────────────
