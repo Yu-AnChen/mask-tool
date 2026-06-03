@@ -473,18 +473,22 @@ class RollingBallWidget(QWidget):
         return layer, data, radius_px, out_name
 
     def _add_or_replace_image(self, arr, name, scale, translate, rb_params=None, **kwargs):
+        multiscale = isinstance(arr, list)  # cache → list of pyramid levels
         if name in self._viewer.layers:
             lyr = self._viewer.layers[name]
-            lyr.data = arr
-            lyr.scale = scale
-            lyr.translate = translate
-            if rb_params is not None:
-                lyr.metadata["rb_params"] = rb_params
-            # kwargs (colormap, contrast_limits) only applied on first creation
-        else:
-            lyr = self._viewer.add_image(arr, name=name, scale=scale, translate=translate, **kwargs)
-            if rb_params is not None:
-                lyr.metadata["rb_params"] = rb_params
+            if lyr.multiscale == multiscale:
+                lyr.data = arr
+                lyr.scale = scale
+                lyr.translate = translate
+                if rb_params is not None:
+                    lyr.metadata["rb_params"] = rb_params
+                # kwargs (colormap, contrast_limits) only applied on first creation
+                return
+            self._viewer.layers.remove(lyr)  # single ↔ multiscale switch → recreate
+        lyr = self._viewer.add_image(arr, name=name, scale=scale, translate=translate,
+                                     multiscale=multiscale, **kwargs)
+        if rb_params is not None:
+            lyr.metadata["rb_params"] = rb_params
 
     def _on_preview(self):
         inputs = self._current_inputs()
@@ -535,7 +539,8 @@ class RollingBallWidget(QWidget):
         self._cache_btn.setEnabled(True)
         self._preview_btn.setEnabled(True)
         rb_params = {"source_layer": src_name, "radius_um": radius_µm, "cached": True}
-        self._add_or_replace_image(da.from_zarr(arr), out_name, scale, translate,
+        levels = [da.from_zarr(arr[str(i)]) for i in range(3)]
+        self._add_or_replace_image(levels, out_name, scale, translate,
                                    rb_params=rb_params,
                                    colormap=colormap, contrast_limits=contrast_limits)
 

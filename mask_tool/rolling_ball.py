@@ -54,6 +54,24 @@ def _to_dask(src: "zarr.Array | np.ndarray | da.Array", chunk_size: int) -> "da.
     return da.from_array(src, chunks=(chunk_size, chunk_size))
 
 
+def _downsample4(x: "da.Array") -> "da.Array":
+    """Lazy 4× INTER_AREA downsample for building pyramid levels.
+
+    Input is rechunked to 4096 so every block emits a clean 1024-pixel output
+    chunk; because chunk edges stay a multiple of 4, per-block INTER_AREA is
+    identical to a whole-image INTER_AREA (no seams).
+    """
+    f = 4
+    x = x.rechunk((1024 * f, 1024 * f))
+    out_chunks = tuple(tuple(-(-c // f) for c in ax) for ax in x.chunks)
+
+    def _resize(block: np.ndarray) -> np.ndarray:
+        h, w = block.shape
+        return cv2.resize(block, (-(-w // f), -(-h // f)), interpolation=cv2.INTER_AREA)
+
+    return x.map_blocks(_resize, dtype=x.dtype, chunks=out_chunks)
+
+
 # ── shrink helpers ───────────────────────────────────────────────────────── #
 
 def _shrink_params(radius: float) -> tuple[int, float]:
@@ -186,7 +204,7 @@ def subtract_background(
     chunk_size: int = 2048,
     num_workers: int | None = None,
     out_path: str | None = None,
-) -> zarr.Array:
+) -> "zarr.Array | zarr.hierarchy.Group":
     """
     Subtract rolling-ball background from a large 2-D image, write to Zarr.
 
@@ -202,7 +220,10 @@ def subtract_background(
 
     Returns
     -------
-    zarr.Array in the source dtype with background subtracted, clipped to ≥ 0
+    If out_path is None: an in-memory zarr.Array (source dtype, clipped ≥ 0).
+    Otherwise: a zarr group with 3 multiscale levels named '0','1','2' — level 0
+    at full resolution (chunk_size), levels 1-2 successive 4× INTER_AREA
+    downsamples (chunk 1024).
     """
     n_cores = num_workers or os.cpu_count() or 1
     dask_workers, omp_threads = _thread_split(radius, n_cores)
@@ -214,15 +235,24 @@ def subtract_background(
                                  omp_threads=omp_threads)
     result = (x.astype(np.float32) - bg).clip(min=0).astype(src_dtype)
 
-    out_arr = (
-        zarr.open_array(out_path, mode="w", shape=x.shape,
-                        chunks=(chunk_size, chunk_size), dtype=src_dtype)
-        if out_path
-        else zarr.zeros(x.shape, chunks=(chunk_size, chunk_size), dtype=src_dtype)
-    )
+    # In-memory result (no caching): single-level zarr array, as before.
+    if out_path is None:
+        out_arr = zarr.zeros(x.shape, chunks=(chunk_size, chunk_size), dtype=src_dtype)
+        da.store(result, out_arr, scheduler="threads", num_workers=dask_workers)
+        return out_arr
 
-    da.store(result, out_arr, scheduler="threads", num_workers=dask_workers)
-    return out_arr
+    # Cached result: 3-level multiscale zarr group. Level 0 is the full-res
+    # subtraction; levels 1-2 read the previous level back from disk and 4×
+    # downsample, so the rolling ball is computed only once (for level 0).
+    group = zarr.open_group(out_path, mode="w")
+    level = result
+    for i in range(3):
+        cs = chunk_size if i == 0 else 1024
+        level = level.rechunk((cs, cs))
+        out = group.zeros(str(i), shape=level.shape, chunks=(cs, cs), dtype=src_dtype)
+        da.store(level, out, scheduler="threads", num_workers=dask_workers)
+        level = _downsample4(da.from_zarr(out))
+    return group
 
 
 def subtract_background_lazy(
