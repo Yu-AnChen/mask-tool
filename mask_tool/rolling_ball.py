@@ -123,6 +123,16 @@ def _rolling_ball_block(
     # Step 1: pre-smooth with 3×3 mean (matches imagec doPresmooth)
     fp = cv2.blur(fp, (3, 3))
 
+    # Pad bottom/right up to a multiple of sf BEFORE min-pooling. Otherwise
+    # _min_pool_2d drops the < sf remainder rows/cols, and the Step-4 upsample
+    # then stretches the background across them — under-estimating it and leaving
+    # a brighter strip on the image's bottom/right edge. Padding makes Step 4 an
+    # exact ×sf upsample (no stretch); we crop back to the original shape after.
+    h, w = fp.shape
+    ph, pw = (-h) % sf, (-w) % sf
+    if ph or pw:
+        fp = np.pad(fp, ((0, ph), (0, pw)), mode="edge")
+
     # Step 2: min-pool → shrunk image
     small = _min_pool_2d(fp, sf)
 
@@ -130,13 +140,13 @@ def _rolling_ball_block(
     small_bg = _skimage_rb(small, radius=max(radius / sf, 1.0),
                            num_threads=omp_threads)
 
-    # Step 4: bilinear upsample back to block shape
+    # Step 4: bilinear upsample back to the (padded) block, then crop to original
     bg = cv2.resize(
         np.asarray(small_bg, dtype=np.float32),
         (fp.shape[1], fp.shape[0]),   # cv2 takes (width, height)
         interpolation=cv2.INTER_LINEAR,
     )
-    return bg
+    return bg[:h, :w]
 
 
 def _thread_split(radius: float, n_cores: int) -> tuple[int, int]:
