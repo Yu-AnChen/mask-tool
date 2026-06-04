@@ -223,6 +223,7 @@ class _AddFileDialog(QDialog):
         header.addWidget(desel_all)
         ch_layout.addLayout(header)
         self._ch_list = QListWidget()
+        self._ch_list.setMinimumHeight(240)
         for i, nm in enumerate(ch_names):
             it = QListWidgetItem(f"{i}: {nm}")
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -238,7 +239,7 @@ class _AddFileDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self.resize(380, 460)
+        self.setMinimumWidth(400)
         self._on_type_changed()
 
     def _set_all(self, state):
@@ -246,7 +247,10 @@ class _AddFileDialog(QDialog):
             self._ch_list.item(i).setCheckState(state)
 
     def _on_type_changed(self):
+        # Channel list only applies to multi-channel images; hide it otherwise
+        # and shrink the dialog to fit so there are no empty gaps.
         self._ch_widget.setVisible(self.layer_type() == "image")
+        self.adjustSize()
 
     def layer_type(self) -> str:
         return self._type.currentData()
