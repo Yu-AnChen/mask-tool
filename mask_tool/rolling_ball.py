@@ -43,6 +43,11 @@ import zarr
 import dask.array as da
 from skimage.restoration import rolling_ball as _skimage_rb
 
+try:  # package import (normal) vs. running this file directly (smoke test)
+    from .pyramid import write_pyramid_group
+except ImportError:
+    from pyramid import write_pyramid_group
+
 
 # ── dask helper ─────────────────────────────────────────────────────────── #
 
@@ -52,24 +57,6 @@ def _to_dask(src: "zarr.Array | np.ndarray | da.Array", chunk_size: int) -> "da.
     if isinstance(src, zarr.Array):
         return da.from_zarr(src, chunks=(chunk_size, chunk_size))
     return da.from_array(src, chunks=(chunk_size, chunk_size))
-
-
-def _downsample4(x: "da.Array") -> "da.Array":
-    """Lazy 4× INTER_AREA downsample for building pyramid levels.
-
-    Input is rechunked to 4096 so every block emits a clean 1024-pixel output
-    chunk; because chunk edges stay a multiple of 4, per-block INTER_AREA is
-    identical to a whole-image INTER_AREA (no seams).
-    """
-    f = 4
-    x = x.rechunk((1024 * f, 1024 * f))
-    out_chunks = tuple(tuple(-(-c // f) for c in ax) for ax in x.chunks)
-
-    def _resize(block: np.ndarray) -> np.ndarray:
-        h, w = block.shape
-        return cv2.resize(block, (-(-w // f), -(-h // f)), interpolation=cv2.INTER_AREA)
-
-    return x.map_blocks(_resize, dtype=x.dtype, chunks=out_chunks)
 
 
 # ── shrink helpers ───────────────────────────────────────────────────────── #
@@ -253,16 +240,10 @@ def subtract_background(
 
     # Cached result: 3-level multiscale zarr group. Level 0 is the full-res
     # subtraction; levels 1-2 read the previous level back from disk and 4×
-    # downsample, so the rolling ball is computed only once (for level 0).
-    group = zarr.open_group(out_path, mode="w")
-    level = result
-    for i in range(3):
-        cs = chunk_size if i == 0 else 1024
-        level = level.rechunk((cs, cs))
-        out = group.zeros(str(i), shape=level.shape, chunks=(cs, cs), dtype=src_dtype)
-        da.store(level, out, scheduler="threads", num_workers=dask_workers)
-        level = _downsample4(da.from_zarr(out))
-    return group
+    # INTER_AREA downsample, so the rolling ball is computed only once (level 0).
+    return write_pyramid_group(result, out_path, chunk0=chunk_size, chunk_lo=1024,
+                               n_levels=3, factor=4, interpolation=cv2.INTER_AREA,
+                               dask_workers=dask_workers)
 
 
 def subtract_background_lazy(
