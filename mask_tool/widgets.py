@@ -189,10 +189,13 @@ def _refresh_combo(combo: QComboBox, choices: list[str]) -> None:
 # ── spatial helpers ───────────────────────────────────────────────────────────
 
 
+def _level0(data: "np.ndarray | da.Array | list") -> "np.ndarray | da.Array":
+    """Full-resolution array of a (possibly multiscale) layer.data."""
+    return data if isinstance(data, (np.ndarray, da.Array)) else data[0]
+
+
 def _get_layer_data_2d(layer: "napari.layers.Image") -> "np.ndarray | da.Array":
-    data = layer.data
-    if not isinstance(data, (np.ndarray, da.Array)):
-        data = data[0]
+    data = _level0(layer.data)
     if data.ndim != 2:
         raise ValueError(f"Layer {layer.name!r} is not 2-D (shape={data.shape})")
     return data
@@ -935,7 +938,7 @@ class _MaskRow(QWidget):
         for lyr in reversed(self._viewer.layers):
             if not isinstance(lyr, napari.layers.Labels):
                 continue
-            if filter_shape is not None and lyr.data.shape != filter_shape:
+            if filter_shape is not None and _level0(lyr.data).shape != filter_shape:
                 continue
             scale = lyr.scale[-1]
             self.layer_combo.addItem(f"{lyr.name}  {scale:.2f} µm/px", lyr.name)
@@ -1026,7 +1029,7 @@ class CombineWidget(QWidget):
             return None
         name = self._rows[0].layer_name
         if name and name in self._viewer.layers:
-            return self._viewer.layers[name].data.shape
+            return _level0(self._viewer.layers[name].data).shape
         return None
 
     def _add_row(self, first: bool = False):
@@ -1067,7 +1070,7 @@ class CombineWidget(QWidget):
             if not name or name not in self._viewer.layers:
                 print(f"Layer {name!r} not found — skipping combine.")
                 return
-            masks.append(np.asarray(self._viewer.layers[name].data).astype(bool))
+            masks.append(np.asarray(_level0(self._viewer.layers[name].data)).astype(bool))
 
         px = float(self._viewer.layers[layer_names[0]].scale[-1])
         hole_px = max(1, int(self._holes.value() / px ** 2)) if self._holes.value() > 0 else 0
@@ -1264,7 +1267,7 @@ class ExportWidget(QWidget):
         fmt = self._format_combo.currentText()
         base_params = self._collect_params(layer_name)
         self._set_export_enabled(False)
-        worker = _export_worker(layer.data, mask_px, src_px, out, fmt, base_params)
+        worker = _export_worker(_level0(layer.data), mask_px, src_px, out, fmt, base_params)
         worker.returned.connect(self._on_export_done)
         worker.errored.connect(self._on_export_error)
         worker.start()
@@ -1284,7 +1287,7 @@ class ExportWidget(QWidget):
         log_path     = out_path.parent / f"{stem}-params.json"
         base_params = self._collect_params(layer_name)
         self._set_export_enabled(False)
-        worker = _quick_export_worker(layer.data, mask_px, src_px,
+        worker = _quick_export_worker(_level0(layer.data), mask_px, src_px,
                                       geojson_path, tiff_path, log_path, base_params)
         worker.returned.connect(self._on_quick_export_done)
         worker.errored.connect(self._on_export_error)

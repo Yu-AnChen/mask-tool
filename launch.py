@@ -160,6 +160,12 @@ def main(argv: list[str] | None = None) -> None:
         thr_widget.set_px_size_override(args.px_size)
         print(f"  px override: {args.px_size} µm (--px-size)")
 
+    # Route drag-and-drop of palom-readable files through a dialog so layers get
+    # the correct pixel size / type instead of napari's default eager reader.
+    from mask_tool.dnd import install_drop_handler
+    install_drop_handler(viewer, default_px_size=args.px_size,
+                         cache_dir=rb_widget._cache_dir)
+
     if args.params:
         import json
         params_path = pathlib.Path(args.params)
