@@ -163,13 +163,13 @@ def _labels_layers(viewer: "napari.Viewer") -> list[str]:
 def _next_label(viewer: "napari.Viewer") -> int:
     """Return the smallest positive label value not already used by any Labels layer."""
     import napari.layers
-    used = {
-        int(v)
-        for lyr in viewer.layers
-        if isinstance(lyr, napari.layers.Labels)
-        for v in [lyr.data.max()]
-        if v > 0
-    }
+    used = set()
+    for lyr in viewer.layers:
+        if not isinstance(lyr, napari.layers.Labels):
+            continue
+        m = int(_level0(lyr.data).max())   # _level0 handles multiscale Labels
+        if m > 0:
+            used.add(m)
     v = 1
     while v in used:
         v += 1
