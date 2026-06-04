@@ -38,8 +38,9 @@ from numcodecs import Blosc
 
 from qtpy.QtCore import QObject, QEvent, Qt
 from qtpy.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout, QComboBox, QDoubleSpinBox, QLabel,
-    QListWidget, QListWidgetItem, QDialogButtonBox,
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QComboBox,
+    QDoubleSpinBox, QLabel, QPushButton, QListWidget, QListWidgetItem,
+    QDialogButtonBox,
 )
 from napari.qt.threading import thread_worker
 
@@ -207,16 +208,28 @@ class _AddFileDialog(QDialog):
         form.addRow("Pixel size:", self._px)
         root.addLayout(form)
 
-        self._ch_label = QLabel("Channels:")
-        root.addWidget(self._ch_label)
+        # Channel section (multi-channel images only) — grows with the dialog.
+        self._ch_widget = QWidget()
+        ch_layout = QVBoxLayout(self._ch_widget)
+        ch_layout.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Channels:"))
+        header.addStretch()
+        sel_all = QPushButton("Select all")
+        desel_all = QPushButton("Deselect all")
+        sel_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        desel_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        header.addWidget(sel_all)
+        header.addWidget(desel_all)
+        ch_layout.addLayout(header)
         self._ch_list = QListWidget()
         for i, nm in enumerate(ch_names):
             it = QListWidgetItem(f"{i}: {nm}")
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(Qt.CheckState.Checked)
             self._ch_list.addItem(it)
-        self._ch_list.setMaximumHeight(120)
-        root.addWidget(self._ch_list)
+        ch_layout.addWidget(self._ch_list, 1)
+        root.addWidget(self._ch_widget, 1)   # take the dialog's extra vertical space
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                    QDialogButtonBox.StandardButton.Cancel)
@@ -225,12 +238,15 @@ class _AddFileDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+        self.resize(380, 460)
         self._on_type_changed()
 
+    def _set_all(self, state):
+        for i in range(self._ch_list.count()):
+            self._ch_list.item(i).setCheckState(state)
+
     def _on_type_changed(self):
-        show = self.layer_type() == "image"
-        self._ch_label.setVisible(show)
-        self._ch_list.setVisible(show)
+        self._ch_widget.setVisible(self.layer_type() == "image")
 
     def layer_type(self) -> str:
         return self._type.currentData()
