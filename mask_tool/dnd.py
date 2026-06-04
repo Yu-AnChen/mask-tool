@@ -39,7 +39,7 @@ from numcodecs import Blosc
 from qtpy.QtCore import QObject, QEvent, Qt
 from qtpy.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QComboBox,
-    QDoubleSpinBox, QLabel, QPushButton, QListWidget, QListWidgetItem,
+    QDoubleSpinBox, QLabel, QLineEdit, QPushButton, QListWidget, QListWidgetItem,
     QDialogButtonBox,
 )
 from napari.qt.threading import thread_worker
@@ -167,6 +167,21 @@ _TYPE_LABELS = {"image": "Image (multi-channel)", "rgb": "RGB", "mask": "Mask (l
 _TYPE_KEYS = ["image", "rgb", "mask"]
 
 
+class _ChannelList(QListWidget):
+    """Checkable list where a left-click anywhere on a row toggles its checkbox
+    (not just the indicator), toggling exactly once."""
+
+    def mousePressEvent(self, event):
+        item = self.itemAt(event.pos())
+        if item is not None and event.button() == Qt.MouseButton.LeftButton:
+            new = (Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked
+                   else Qt.CheckState.Checked)
+            item.setCheckState(new)
+            self.setCurrentItem(item)
+            return
+        super().mousePressEvent(event)
+
+
 class _AddFileDialog(QDialog):
     def __init__(self, filename, shape, dtype, detected, score, px, ch_names, parent=None):
         super().__init__(parent)
@@ -222,7 +237,12 @@ class _AddFileDialog(QDialog):
         header.addWidget(sel_all)
         header.addWidget(desel_all)
         ch_layout.addLayout(header)
-        self._ch_list = QListWidget()
+        self._ch_filter = QLineEdit()
+        self._ch_filter.setPlaceholderText("Filter channels…")
+        self._ch_filter.setClearButtonEnabled(True)
+        self._ch_filter.textChanged.connect(self._apply_filter)
+        ch_layout.addWidget(self._ch_filter)
+        self._ch_list = _ChannelList()
         self._ch_list.setMinimumHeight(240)
         for i, nm in enumerate(ch_names):
             it = QListWidgetItem(f"{i}: {nm}")
@@ -243,8 +263,18 @@ class _AddFileDialog(QDialog):
         self._on_type_changed()
 
     def _set_all(self, state):
+        # Act on visible (filter-matching) items only, so a filter + Select all
+        # checks just the matches.
         for i in range(self._ch_list.count()):
-            self._ch_list.item(i).setCheckState(state)
+            it = self._ch_list.item(i)
+            if not it.isHidden():
+                it.setCheckState(state)
+
+    def _apply_filter(self, text):
+        t = text.lower()
+        for i in range(self._ch_list.count()):
+            it = self._ch_list.item(i)
+            it.setHidden(t not in it.text().lower())
 
     def _on_type_changed(self):
         # Channel list only applies to multi-channel images; hide it otherwise
