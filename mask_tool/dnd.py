@@ -58,6 +58,8 @@ _DETECT_WINDOW = 1024        # full-res sample tile edge (px)
 _DETECT_MAX_TILES = 6        # cap full-res tiles read during detection
 _DETECT_MIN_PAIRS = 100_000  # accumulate foreground pairs up to this
 _CACHE_DIM_THRESHOLD = 4096  # non-pyramidal images larger than this get cached
+_CACHE_WORKERS = 4           # dask threads for the cache build; capped because the
+                             # downsample is I/O-bound, and peak RAM ∝ workers
 
 
 # ── reader / metadata helpers ──────────────────────────────────────────────── #
@@ -298,9 +300,10 @@ class _AddFileDialog(QDialog):
 
 @thread_worker
 def _build_pyramid_worker(level0, out_path, interpolation, compressor):
+    workers = min(_CACHE_WORKERS, os.cpu_count() or 1)
     return write_pyramid_group(level0, out_path, chunk0=2048, chunk_lo=1024,
                                n_levels=3, factor=4, interpolation=interpolation,
-                               dask_workers=os.cpu_count() or 1, compressor=compressor)
+                               dask_workers=workers, compressor=compressor)
 
 
 def _add_rgb(viewer, reader, px, name):
