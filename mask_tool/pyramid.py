@@ -38,9 +38,16 @@ def _downsample(x: "da.Array", factor: int, interpolation: int,
     x = x.rechunk((out_chunk * f, out_chunk * f))
     out_chunks = tuple(tuple(-(-c // f) for c in ax) for ax in x.chunks)
 
-    def _resize(block: np.ndarray) -> np.ndarray:
-        h, w = block.shape
-        return cv2.resize(block, (-(-w // f), -(-h // f)), interpolation=interpolation)
+    if interpolation == cv2.INTER_NEAREST:
+        # Strided slicing: dtype-agnostic (cv2.resize rejects uint32/uint64,
+        # common for instance-label masks) and exactly nearest. len(range(0,c,f))
+        # == ceil(c/f), so output chunks match out_chunks.
+        def _resize(block: np.ndarray) -> np.ndarray:
+            return block[::f, ::f]
+    else:
+        def _resize(block: np.ndarray) -> np.ndarray:
+            h, w = block.shape
+            return cv2.resize(block, (-(-w // f), -(-h // f)), interpolation=interpolation)
 
     return x.map_blocks(_resize, dtype=x.dtype, chunks=out_chunks)
 

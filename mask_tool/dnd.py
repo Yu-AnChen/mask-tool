@@ -327,17 +327,6 @@ def _add_multichannel(viewer, reader, px, channels, ch_names):
         lyr.metadata["_palom_reader"] = reader
 
 
-def _add_mask_pyramidal(viewer, reader, px, name):
-    levels = [lvl[0] for lvl in reader.pyramid]
-    if not np.issubdtype(levels[0].dtype, np.integer):
-        levels = [lvl.astype(np.int32) for lvl in levels]
-    multiscale = len(levels) > 1
-    lyr = viewer.add_labels(levels if multiscale else levels[0], name=name,
-                            multiscale=multiscale,
-                            scale=(px, px), translate=(px / 2, px / 2))
-    lyr.metadata["_palom_reader"] = reader
-
-
 def _cache_and_add(viewer, reader, px, name, *, channel, as_labels, cache_dir):
     level0 = reader.pyramid[0][channel]
     if as_labels and not np.issubdtype(level0.dtype, np.integer):
@@ -394,11 +383,13 @@ def _handle_drop(viewer, path, default_px, cache_dir):
     if typ == "rgb":
         _add_rgb(viewer, reader, px, name)
     elif typ == "mask":
-        if pyramidal:
-            _add_mask_pyramidal(viewer, reader, px, name)
-        else:
-            _cache_and_add(viewer, reader, px, name, channel=0,
-                           as_labels=True, cache_dir=cache_dir)
+        # Always cache masks to a real pyramid, even when palom reports multiple
+        # levels: palom synthesises coarse levels by coarsening level 0, so
+        # reusing them makes napari re-read the full-res level 0 for every coarse
+        # view (a multi-GB RAM/IO spike for big label masks). Caching builds real
+        # cheap coarse levels (and uses strided nearest, so uint32 labels work).
+        _cache_and_add(viewer, reader, px, name, channel=0,
+                       as_labels=True, cache_dir=cache_dir)
     else:  # image
         if not pyramidal and len(channels) == 1 and max(H, W) > _CACHE_DIM_THRESHOLD:
             _cache_and_add(viewer, reader, px, name, channel=channels[0],
