@@ -400,6 +400,8 @@ def _add_placeholder(viewer, name, shape, px):
 
 def _cache_and_add(viewer, reader, px, name, *, channel, as_labels):
     level0 = reader.pyramid[0][channel]
+    # napari Labels only accepts integer dtypes (rejects float), so cast a float
+    # mask. Not needed for the downsample — strided nearest is dtype-agnostic.
     if as_labels and not np.issubdtype(level0.dtype, np.integer):
         level0 = level0.astype(np.int32)
     interp = cv2.INTER_NEAREST if as_labels else cv2.INTER_AREA
