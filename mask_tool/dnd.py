@@ -315,7 +315,7 @@ def _add_rgb(viewer, reader, px, name):
     lyr.metadata["_palom_reader"] = reader
 
 
-def _add_multichannel(viewer, reader, px, name, channels, ch_names):
+def _add_multichannel(viewer, reader, px, channels, ch_names):
     pyr = [lvl[channels] for lvl in reader.pyramid]
     multiscale = len(pyr) > 1
     names = [ch_names[i] for i in channels]
@@ -380,14 +380,12 @@ def _handle_drop(viewer, path, default_px, cache_dir):
         ch_names = _channel_names(path, C)
     except Exception as e:
         print(f"DnD: could not inspect {path!r}: {e}")
-        del reader
-        return
+        return   # reader released when the local goes out of scope
 
     dlg = _AddFileDialog(os.path.basename(path), (C, H, W), p0.dtype,
                          detected, score, prefill, ch_names)
     if not dlg.exec():
-        del reader   # Cancel → release the file
-        return
+        return   # Cancel → reader released when the local goes out of scope
 
     typ, px, channels = dlg.layer_type(), dlg.pixel_size(), dlg.channels()
     name = _layer_name(path)
@@ -406,7 +404,7 @@ def _handle_drop(viewer, path, default_px, cache_dir):
             _cache_and_add(viewer, reader, px, name, channel=channels[0],
                            as_labels=False, cache_dir=cache_dir)
         else:
-            _add_multichannel(viewer, reader, px, name, channels, ch_names)
+            _add_multichannel(viewer, reader, px, channels, ch_names)
 
 
 class _DropFilter(QObject):
