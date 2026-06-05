@@ -247,7 +247,7 @@ class _AddFileDialog(QDialog):
         for i, nm in enumerate(ch_names):
             it = QListWidgetItem(f"{i}: {nm}")
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            it.setCheckState(Qt.CheckState.Checked)
+            it.setCheckState(Qt.CheckState.Unchecked)
             self._ch_list.addItem(it)
         ch_layout.addWidget(self._ch_list, 1)
         root.addWidget(self._ch_widget, 1)   # take the dialog's extra vertical space
