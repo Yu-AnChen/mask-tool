@@ -15,12 +15,18 @@ that is lazily evaluated (dask + zarr), parameterized, and reusable across chann
 ## Pipeline stages
 
 ```
+Input loading:
+  CLI            : launch.py path.ome.tif [--channels …] [--channel-names …]
+  Drag-and-drop  : drop a palom-readable file → confirmation dialog (type /
+                   pixel size / channels) → layers (see "Drag-and-drop loading")
+
 For each channel mask:
   OME-TIFF (palom OmePyramidReader)
     → [optional] channel subset (--channels / --channel-names CLI args)
     → [optional] rolling-ball BG subtract
         Preview : lazy dask array (on-demand, no disk write)
-        Cache   : computed to zarr on disk in a background thread
+        Cache   : computed in a background thread, written as a 3-level
+                  multiscale zarr pyramid (see "Multiscale pyramid caching")
     → downsample to target pixel size (background thread)
         lazy_resize: map_blocks with chunks aligned to INTER_AREA boundaries
         stored as numpy array (_preview_raw) for fast re-blur
@@ -53,7 +59,7 @@ Write final mask to disk:
 
   File picker dialog triggers save immediately.
   "Save mask and params" button re-saves to the current path.
-  napari show_info notification on completion.
+  Export runs in a background thread; a QMessageBox reports success/failure.
 ```
 
 ---
@@ -175,18 +181,26 @@ Thread allocation is tuned per regime: for sf ≥ 2 the shrunk image is tiny, so
 OpenMP overhead dominates — all cores go to dask parallelism and OpenMP is
 disabled per block. For sf = 1 cores are split evenly between dask and OpenMP.
 
+Block dimensions that aren't a multiple of the shrink factor are edge-padded
+before min-pooling (and cropped after upsampling). Otherwise `_min_pool_2d`
+drops the bottom/right `< sf` remainder and the bilinear upsample stretches the
+background across it, under-subtracting and leaving a brighter strip on the
+image's bottom/right edge. (A residual ~sf/2-px flattening from `cv2.resize`
+edge replication remains and is accepted.) When cached, the subtracted result is
+written as a multiscale pyramid (see "Multiscale pyramid caching").
+
 ### 7. Unique label values for distinct colors
 
 napari colors Labels layers by label value: value 1 always maps to the same color.
 `_next_label(viewer)` returns the smallest positive integer not already used as the
-max value in any existing Labels layer, so each finalized mask gets a distinct color
-without manual bookkeeping.
+max value in any existing Labels layer (taking the full-res level for multiscale
+layers), so each finalized mask gets a distinct color without manual bookkeeping.
 
 ### 8. Combine resolution safety
 
 The seed mask (Mask 1) defines the coordinate frame. Non-seed dropdowns are filtered
-by `data.shape` to match the seed. Changing Mask 1 resets all subsequent rows to
-prevent stale cross-resolution pairings.
+by full-res shape (level 0 for multiscale layers) to match the seed. Changing Mask 1
+resets all subsequent rows to prevent stale cross-resolution pairings.
 
 ### 9. Export pixel size handling
 
@@ -195,6 +209,69 @@ Pixel size is pulled from `layer.scale[-1]` when the mask layer is selected:
   (`shapely.affinity.scale`); user may adjust before saving.
 - **Zarr / OME-TIFF**: pixel_size is metadata only (zarr attrs / OME-XML); locked
   to the layer value.
+
+### 10. Multiscale pyramid caching (shared builder)
+
+Cached arrays — the rolling-ball result, and dropped non-pyramidal masks/images —
+are written as a 3-level multiscale zarr group (levels `"0"/"1"/"2"`, each a 4×
+downsample) via `mask_tool/pyramid.write_pyramid_group`. napari then renders
+zoomed-out views from the small coarse levels instead of pulling full-res chunks
+of a single-scale array.
+
+Levels are written one at a time, each read back from disk before producing the
+next, so an expensive level-0 graph (e.g. the rolling ball) is computed once and
+peak memory stays bounded. Each level is downsampled per dask block; rechunking
+the input to `factor × output_chunk` keeps chunk edges on multiples of `factor`,
+so a per-block resize is bit-identical to a whole-image resize (no seams).
+Interpolation is `INTER_AREA` for intensity and `INTER_NEAREST` for label masks
+(averaging label IDs is meaningless); masks use a zstd compressor.
+
+Widgets read level 0 of a multiscale layer through a `_level0()` helper
+(`_get_layer_data_2d`, `_compute_mask_transform`, `_pick_preview_level`, Combine,
+Export, `_next_label`), so dropped multiscale masks work everywhere.
+
+### 11. Drag-and-drop loading
+
+Dropping a file onto napari's default readers bypasses palom: eager full-res load
+and wrong pixel size (scale 1.0), which corrupts every physical-units result.
+`mask_tool/dnd.py` installs a Qt event filter on the QtViewer that intercepts
+drops of palom-readable files (`.ome.tif/.tif/.qptiff/.svs/.vsi`) and routes them
+through a confirmation dialog; other extensions fall through to napari.
+
+The flow is deferred: a palom reader is built for metadata only, the type is
+auto-detected, and the dialog lets the user confirm/override type, pixel size, and
+channels (with a name filter, row-click toggle, select/deselect-all; channels
+default unchecked). Only on **Add** are layers created (**Cancel** discards the
+reader). The reader is stashed on `layer.metadata` so lazy reads keep working.
+
+Type auto-detection (overridable):
+- 3-channel uint8 → **RGB**, a single `(H,W,C)` image layer (channel axis moved
+  last, no channel split, no channel selection).
+- 1-channel → **mask vs intensity image**, decided by foreground equality (see 12).
+- otherwise → **multi-channel image** (`channel_axis` split, reversed order/names
+  like the CLI loader).
+
+Masks are added as Labels and always cached as a nearest-downsampled pyramid
+unless the source is already pyramidal (then its levels are reused). Non-pyramidal
+single-channel images larger than 4096 px are cached with INTER_AREA; everything
+else uses palom's levels directly. The dialog's pixel size sets layer
+`scale`/`translate`, so all widgets (which key off `layer.scale`) stay consistent
+— the partial `--px-size` / `_px_size_override` mechanism is left unchanged and is
+not extended.
+
+### 12. Mask-vs-intensity detection by foreground equality
+
+A label mask is piecewise-constant (every pixel inside an object equals its
+neighbours; only boundaries differ); an intensity image has per-pixel noise. The
+discriminator is the fraction of neighbouring **foreground** pixels (both nonzero)
+that are identical — ~0.9+ for masks regardless of label count or object size,
+~0.01 for intensity. Excluding background is essential: a cropped FOV with large
+zero regions would otherwise false-positive. The metric is computed on full-res
+sample tiles located via the coarsest pyramid level (densest tissue first), so
+detection ignores the glass/exterior that dominates a WSI's top-left. Threshold
+0.5; falls back to the integer-dtype rule when content is too sparse to judge.
+(Compression ratio was considered but rejected — it conflates piecewise-constancy
+with storage bit-depth.)
 
 ---
 
@@ -239,10 +316,12 @@ mask_tool/
   __init__.py
   pipeline.py      — remove_small_objects, remove_small_holes, combine_masks, CombineParams
   resize.py        — lazy_resize (map_blocks, aligned chunk sizing)
+  pyramid.py       — write_pyramid_group (shared multiscale zarr pyramid builder)
   rolling_ball.py  — subtract_background, subtract_background_lazy, rolling_ball_background
+  dnd.py           — drag-and-drop: reader routing, type detection, Add dialog, install_drop_handler
   export.py        — export_geojson, export_zarr, export_tiff, save_params, mask_to_polygon
   widgets.py       — RollingBallWidget, ThresholdWidget, CombineWidget, ExportWidget, MaskInfoWidget
-launch.py          — CLI entry point (--channels, --channel-names)
+launch.py          — CLI entry point (--channels, --channel-names, --px-size); installs drop handler
 ```
 
 ---
@@ -255,3 +334,20 @@ launch.py          — CLI entry point (--channels, --channel-names)
 - **napari-mcp**: not yet installed; deferred.
 - **Threshold widget**: contrast_limits approach is more idiomatic in napari than a
   separate slider and requires no custom widget.
+- **Mask-vs-intensity detection metric**: foreground adjacent-equality chosen over
+  compression ratio (which conflates piecewise-constancy with storage bit-depth).
+
+## Open / deferred
+
+- **High RAM during/after rolling-ball cache**: not a leak — the spike is the
+  parallel compute working set (`num_workers × per-block float32`, all cores for
+  radius > 10), retained by the allocator and plateauing across runs. Fix later by
+  capping `num_workers` or running the compute in a subprocess (the on-disk zarr is
+  already the hand-off).
+- **Drag-and-drop RGB / multi-channel caching**: deferred — those inputs are almost
+  always already pyramidal, so palom's levels are used directly; the shared builder
+  would need to generalise past 2-D to cache them.
+- **Dropped masks are view-only**: dask/zarr-backed Labels aren't paintable; fine
+  for combine/export, which is the intent.
+- **Drop handler hook point**: filter is on `viewer.window._qt_viewer`; may need to
+  move to the vispy canvas child depending on napari version (verify in the app).
