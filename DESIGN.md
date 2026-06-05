@@ -223,8 +223,10 @@ next, so an expensive level-0 graph (e.g. the rolling ball) is computed once and
 peak memory stays bounded. Each level is downsampled per dask block; rechunking
 the input to `factor × output_chunk` keeps chunk edges on multiples of `factor`,
 so a per-block resize is bit-identical to a whole-image resize (no seams).
-Interpolation is `INTER_AREA` for intensity and `INTER_NEAREST` for label masks
-(averaging label IDs is meaningless); masks use a zstd compressor.
+Interpolation is `INTER_AREA` for intensity and nearest for label masks (averaging
+label IDs is meaningless). The nearest path uses **strided slicing** (`block[::f,
+::f]`) rather than `cv2.resize`, which is dtype-agnostic (cv2 rejects uint32/uint64)
+and exactly nearest with matching chunk sizes; masks use a zstd compressor.
 
 Widgets read level 0 of a multiscale layer through a `_level0()` helper
 (`_get_layer_data_2d`, `_compute_mask_transform`, `_pick_preview_level`, Combine,
@@ -251,13 +253,20 @@ Type auto-detection (overridable):
 - otherwise → **multi-channel image** (`channel_axis` split, reversed order/names
   like the CLI loader).
 
-Masks are added as Labels and always cached as a nearest-downsampled pyramid
-unless the source is already pyramidal (then its levels are reused). Non-pyramidal
-single-channel images larger than 4096 px are cached with INTER_AREA; everything
-else uses palom's levels directly. The dialog's pixel size sets layer
-`scale`/`translate`, so all widgets (which key off `layer.scale`) stay consistent
-— the partial `--px-size` / `_px_size_override` mechanism is left unchanged and is
-not extended.
+Masks are added as Labels and **always** cached as a nearest-downsampled pyramid
+(strided slicing, not `cv2.resize`, which rejects the uint32/uint64 dtypes common
+for instance-label masks). Reusing palom's levels is *not* safe: palom synthesises
+coarse pyramid levels by coarsening level 0 (chunk sizes halve per level), so
+reading any coarse level pulls the **entire full-res level 0** — a multi-GB RAM/IO
+spike (e.g. a 13.5 GB uint32 level 0 read just for the thumbnail; napari `Labels`
+creation measured at ~3.9 GB → 63 MB after caching). Caching reads level 0 once in
+a background thread (~1.1 GB peak at 4 workers on that mask) and builds real cheap
+coarse levels. Non-pyramidal single-channel images larger than 4096 px are cached
+with INTER_AREA; multi-channel / RGB images use palom's levels directly (caching
+deferred), so they share palom's coarse-read cost — as does the CLI-loaded image.
+The dialog's pixel size sets layer `scale`/`translate`, so all widgets (which key
+off `layer.scale`) stay consistent — the partial `--px-size` / `_px_size_override`
+mechanism is left unchanged and is not extended.
 
 ### 12. Mask-vs-intensity detection by foreground equality
 
@@ -344,9 +353,14 @@ launch.py          — CLI entry point (--channels, --channel-names, --px-size);
   radius > 10), retained by the allocator and plateauing across runs. Fix later by
   capping `num_workers` or running the compute in a subprocess (the on-disk zarr is
   already the hand-off).
-- **Drag-and-drop RGB / multi-channel caching**: deferred — those inputs are almost
-  always already pyramidal, so palom's levels are used directly; the shared builder
-  would need to generalise past 2-D to cache them.
+- **palom synthesises pyramids**: `OmePyramidReader` derives coarse levels by
+  coarsening level 0, so reading any coarse level pulls the full-res level 0. Masks
+  work around this by always caching (decision 11), but **dropped RGB / multi-channel
+  images and the CLI-loaded image still use palom's levels directly** and therefore
+  re-read level 0 for coarse views. Caching them is deferred (the shared builder is
+  2-D only; would need to handle the channel axis). A cleaner fix would read the
+  TIFF's *stored* pyramid IFDs (e.g. via tifffile) instead of palom's synthesised
+  ones.
 - **Dropped masks are view-only**: dask/zarr-backed Labels aren't paintable; fine
   for combine/export, which is the intent.
 - **Drop handler hook point**: filter is on `viewer.window._qt_viewer`; may need to
