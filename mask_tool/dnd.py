@@ -42,11 +42,16 @@ from qtpy.QtWidgets import (
     QDialogButtonBox,
 )
 from napari.qt.threading import thread_worker
+from napari.utils.notifications import show_info
 
 try:  # package import (normal) vs. direct execution
     from .pyramid import write_pyramid_group
 except ImportError:
     from pyramid import write_pyramid_group
+
+# Names whose pyramid is currently building in the background — guards against an
+# impatient user re-dropping the same file and starting duplicate builds.
+_BUILDING: set = set()
 
 
 # Extensions palom can open; others fall through to napari's default readers.
@@ -59,6 +64,9 @@ _DETECT_MIN_PAIRS = 100_000  # accumulate foreground pairs up to this
 _CACHE_DIM_THRESHOLD = 4096  # non-pyramidal images larger than this get cached
 _CACHE_WORKERS = 4           # dask threads for the cache build; capped because the
                              # downsample is I/O-bound, and peak RAM ∝ workers
+_PYRAMID_FACTOR = 2          # downsample factor between cached coarse levels
+                             # (2 = finer steps / smoother zoom; 4 = fewer levels)
+_PYRAMID_MIN_DIM = 1024      # build coarse levels until the coarsest max-dim ≤ this
 
 
 # ── reader / metadata helpers ──────────────────────────────────────────────── #
@@ -317,16 +325,30 @@ class _AddFileDialog(QDialog):
 
 # ── layer construction ─────────────────────────────────────────────────────── #
 
+def _n_levels(shape, factor: int, min_dim: int) -> int:
+    """Levels (incl. level 0) so the coarsest level's max dim is ≤ min_dim."""
+    m = max(int(shape[-2]), int(shape[-1]))
+    n = 1
+    while m > min_dim:
+        m = -(-m // factor)   # ceil div
+        n += 1
+    return max(n, 2)          # at least one coarse level
+
+
 @thread_worker
 def _build_pyramid_worker(level0, interpolation, compressor):
     # Build only the cheap coarse levels into an in-memory (zstd) zarr — the
     # caller keeps the reader's native level 0 for the top of the multiscale
     # stack. The full-res level 0 is read once to make level 1; we skip
     # re-compressing/re-reading and any disk cache. Coarse levels are tiny
-    # (~tens of MB compressed), so they live in RAM with the layer.
+    # (~tens of MB compressed), so they live in RAM with the layer. Build enough
+    # levels (at _PYRAMID_FACTOR steps) to reach a small coarsest level, so napari
+    # has a cheap level for every zoom and the overview isn't a huge raster.
     workers = min(_CACHE_WORKERS, os.cpu_count() or 1)
+    n_levels = _n_levels(level0.shape, _PYRAMID_FACTOR, _PYRAMID_MIN_DIM)
     return write_pyramid_group(level0, None, chunk0=2048, chunk_lo=1024,
-                               n_levels=3, factor=4, interpolation=interpolation,
+                               n_levels=n_levels, factor=_PYRAMID_FACTOR,
+                               interpolation=interpolation,
                                dask_workers=workers, compressor=compressor,
                                store_level0=False)
 
@@ -364,6 +386,18 @@ def _add_mask_pyramidal(viewer, reader, px, name):
     lyr.metadata["_palom_reader"] = reader
 
 
+def _add_placeholder(viewer, name, shape, px):
+    """A faint footprint-sized marker shown while the pyramid builds, so the user
+    sees it's working (and doesn't re-drop). Replaced by the real layer when done."""
+    H, W = int(shape[-2]), int(shape[-1])
+    block = np.full((16, 16), 128, np.uint8)
+    return viewer.add_image(block, name=f"{name} (building…)",
+                            scale=(H * px / 16, W * px / 16),
+                            translate=(px / 2, px / 2), colormap="gray",
+                            contrast_limits=(0, 255), opacity=0.25,
+                            blending="translucent")
+
+
 def _cache_and_add(viewer, reader, px, name, *, channel, as_labels):
     level0 = reader.pyramid[0][channel]
     if as_labels and not np.issubdtype(level0.dtype, np.integer):
@@ -372,7 +406,20 @@ def _cache_and_add(viewer, reader, px, name, *, channel, as_labels):
     compressor = (Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
                   if as_labels else "default")
 
+    if name in _BUILDING:
+        show_info(f"'{name}' is already building.")
+        return
+    _BUILDING.add(name)
+    placeholder = _add_placeholder(viewer, name, level0.shape, px)
+    show_info(f"Building '{name}' in the background…")
+
+    def _cleanup():
+        _BUILDING.discard(name)
+        if placeholder in viewer.layers:
+            viewer.layers.remove(placeholder)
+
     def _done(group):
+        _cleanup()
         # palom's native level 0 on top, cached coarse levels below.
         coarse = [da.from_zarr(group[k]) for k in sorted(group.array_keys(), key=int)]
         levels = [level0, *coarse]
@@ -384,16 +431,25 @@ def _cache_and_add(viewer, reader, px, name, *, channel, as_labels):
                                    contrast_limits=(0, 5000),
                                    scale=(px, px), translate=(px / 2, px / 2))
         lyr.metadata["_palom_reader"] = reader   # keep level 0 readable
+        show_info(f"'{name}' ready")
+
+    def _on_err(e):
+        _cleanup()
+        print(f"DnD pyramid build error: {e}")
+        show_info(f"Failed to build '{name}': {e}")
 
     worker = _build_pyramid_worker(level0, interp, compressor)
     worker.returned.connect(_done)
-    worker.errored.connect(lambda e: print(f"DnD pyramid build error: {e}"))
+    worker.errored.connect(_on_err)
     worker.start()
 
 
 # ── drop handling ──────────────────────────────────────────────────────────── #
 
 def _handle_drop(viewer, path, default_px):
+    if _layer_name(path) in _BUILDING:
+        show_info(f"'{_layer_name(path)}' is still building — please wait.")
+        return
     try:
         reader = _make_reader(path)
     except Exception as e:

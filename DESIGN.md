@@ -213,13 +213,16 @@ Pixel size is pulled from `layer.scale[-1]` when the mask layer is selected:
 ### 10. Multiscale pyramid caching (shared builder)
 
 Cached arrays — the rolling-ball result, and dropped non-pyramidal masks/images —
-are written as a 3-level multiscale zarr group (levels `"0"/"1"/"2"`, each a 4×
+are written as a multiscale zarr group (levels `"0"/"1"/…`, each a `factor`×
 downsample) via `mask_tool/pyramid.write_pyramid_group`. napari then renders
 zoomed-out views from the small coarse levels instead of pulling full-res chunks
 of a single-scale array. The group can be **on-disk** (`out_path=...`, rolling
-ball) or an **in-memory zstd zarr** (`out_path=None`, drag-and-drop), and
-`store_level0=False` builds only the coarse levels when the caller already has a
-cheap full-res source for the top of the stack.
+ball, `factor=4`, 3 levels) or an **in-memory zstd zarr** (`out_path=None`,
+drag-and-drop), and `store_level0=False` builds only the coarse levels when the
+caller already has a cheap full-res source for the top of the stack. Drag-and-drop
+uses `factor=2` and builds enough levels (`_n_levels`) for the coarsest to be
+≤ ~1024 px — finer steps so napari has a cheap level for every zoom and the
+overview isn't a huge raster (smoother zoom than `factor=4`, at a slower build).
 
 Levels are written one at a time, each read back from disk before producing the
 next, so an expensive level-0 graph (e.g. the rolling ball) is computed once and
@@ -267,13 +270,18 @@ every coarse read re-computes from the full-res level 0 — a multi-GB RAM/IO sp
 
 So:
 - **Mask, true pyramid** → reuse the stored levels (`_add_mask_pyramidal`, cheap).
-- **Mask, non-pyramidal** → keep the reader's native level 0 on top and build only
-  the coarse levels (nearest via strided slicing — `cv2.resize` rejects
-  uint32/uint64) into an **in-memory zstd zarr** (`out_path=None,
-  store_level0=False`). Reads level 0 once in a background thread (~1 GB peak at
-  4 workers, ~6 s) → coarse levels are tens of MB in RAM (18 MB for the 13.5 GB
-  test mask), no disk cache. napari uses the cached coarse for thumbnail/overview
-  and palom's level 0 only when zoomed to full res (Labels creation ~3.9 GB → 63 MB).
+- **Mask, non-pyramidal** → keep the reader's native level 0 on top and build the
+  coarse levels (factor 2, down to ≤ ~1024 px; nearest via strided slicing —
+  `cv2.resize` rejects uint32/uint64) into an **in-memory zstd zarr**
+  (`out_path=None, store_level0=False`). Reads level 0 once in a background thread
+  (~1 GB peak; build time barely improves past 2 workers since levels are
+  sequential — `_CACHE_WORKERS=4`). Coarse levels are tens of MB in RAM (61 MB at
+  factor 2 / ~19 s for the 13.5 GB test mask; 18 MB / ~6 s at factor 4), no disk
+  cache. napari uses the cached coarse for thumbnail/overview and palom's level 0
+  only when zoomed to full res (Labels creation ~3.9 GB → 63 MB).
+  - While building, a faint footprint-sized `"{name} (building…)"` placeholder
+    layer + a notification show progress; the real layer replaces it on completion.
+    `_BUILDING` guards against re-dropping the same file mid-build.
 - **Image, non-pyramidal single-channel > 4096 px** → same coarse-only in-memory
   cache with INTER_AREA (palom level 0 on top).
 - **Image, multi-channel / RGB** → palom levels directly (caching deferred). If the
