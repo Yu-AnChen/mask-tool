@@ -78,6 +78,26 @@ def _make_reader(path: str, pixel_size: float | None = None):
     return R.OmePyramidReader(path, pixel_size=pixel_size)
 
 
+def _is_pyramidal(path: str) -> bool:
+    """True if the file stores real pyramid levels (mirrors palom's own check).
+
+    palom's OmePyramidReader uses stored levels when present, but otherwise falls
+    back to synthesising a pyramid by coarsening level 0 (da.coarsen) — in which
+    case `reader.pyramid` still has >1 level, but every coarse level re-reads the
+    full-res level 0. So `len(reader.pyramid) > 1` cannot tell the two apart; we
+    check the source directly.
+    """
+    low = path.lower()
+    if low.endswith((".svs", ".vsi")):
+        return True   # these readers expose real pyramid levels
+    try:
+        import tifffile
+        with tifffile.TiffFile(path) as tf:
+            return len(tf.series) > 1 or len(tf.series[0].levels) > 1
+    except Exception:
+        return False
+
+
 def _channel_names(path: str, n: int) -> list[str]:
     try:
         import ome_types
@@ -327,6 +347,18 @@ def _add_multichannel(viewer, reader, px, channels, ch_names):
         lyr.metadata["_palom_reader"] = reader
 
 
+def _add_mask_pyramidal(viewer, reader, px, name):
+    """Reuse the file's real stored pyramid levels (cheap coarse reads)."""
+    levels = [lvl[0] for lvl in reader.pyramid]
+    if not np.issubdtype(levels[0].dtype, np.integer):
+        levels = [lvl.astype(np.int32) for lvl in levels]
+    multiscale = len(levels) > 1
+    lyr = viewer.add_labels(levels if multiscale else levels[0], name=name,
+                            multiscale=multiscale,
+                            scale=(px, px), translate=(px / 2, px / 2))
+    lyr.metadata["_palom_reader"] = reader
+
+
 def _cache_and_add(viewer, reader, px, name, *, channel, as_labels, cache_dir):
     level0 = reader.pyramid[0][channel]
     if as_labels and not np.issubdtype(level0.dtype, np.integer):
@@ -378,18 +410,22 @@ def _handle_drop(viewer, path, default_px, cache_dir):
 
     typ, px, channels = dlg.layer_type(), dlg.pixel_size(), dlg.channels()
     name = _layer_name(path)
-    pyramidal = len(reader.pyramid) > 1
+    # True stored pyramid vs palom's coarsen fallback — NOT len(reader.pyramid),
+    # which is >1 in both cases.
+    pyramidal = _is_pyramidal(path)
 
     if typ == "rgb":
         _add_rgb(viewer, reader, px, name)
     elif typ == "mask":
-        # Always cache masks to a real pyramid, even when palom reports multiple
-        # levels: palom synthesises coarse levels by coarsening level 0, so
-        # reusing them makes napari re-read the full-res level 0 for every coarse
-        # view (a multi-GB RAM/IO spike for big label masks). Caching builds real
-        # cheap coarse levels (and uses strided nearest, so uint32 labels work).
-        _cache_and_add(viewer, reader, px, name, channel=0,
-                       as_labels=True, cache_dir=cache_dir)
+        if pyramidal:
+            _add_mask_pyramidal(viewer, reader, px, name)   # real cheap levels
+        else:
+            # Non-pyramidal source: palom would synthesise coarse levels by
+            # coarsening level 0 (mean — wrong for labels — and every coarse view
+            # re-reads the full-res level 0, a multi-GB spike). Cache to a real
+            # pyramid with strided nearest (also handles uint32 labels).
+            _cache_and_add(viewer, reader, px, name, channel=0,
+                           as_labels=True, cache_dir=cache_dir)
     else:  # image
         if not pyramidal and len(channels) == 1 and max(H, W) > _CACHE_DIM_THRESHOLD:
             _cache_and_add(viewer, reader, px, name, channel=channels[0],

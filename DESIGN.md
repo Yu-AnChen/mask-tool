@@ -253,17 +253,27 @@ Type auto-detection (overridable):
 - otherwise → **multi-channel image** (`channel_axis` split, reversed order/names
   like the CLI loader).
 
-Masks are added as Labels and **always** cached as a nearest-downsampled pyramid
-(strided slicing, not `cv2.resize`, which rejects the uint32/uint64 dtypes common
-for instance-label masks). Reusing palom's levels is *not* safe: palom synthesises
-coarse pyramid levels by coarsening level 0 (chunk sizes halve per level), so
-reading any coarse level pulls the **entire full-res level 0** — a multi-GB RAM/IO
-spike (e.g. a 13.5 GB uint32 level 0 read just for the thumbnail; napari `Labels`
-creation measured at ~3.9 GB → 63 MB after caching). Caching reads level 0 once in
-a background thread (~1.1 GB peak at 4 workers on that mask) and builds real cheap
-coarse levels. Non-pyramidal single-channel images larger than 4096 px are cached
-with INTER_AREA; multi-channel / RGB images use palom's levels directly (caching
-deferred), so they share palom's coarse-read cost — as does the CLI-loaded image.
+Reuse-vs-cache hinges on whether the **source** stores a real pyramid, detected by
+`_is_pyramidal(path)` (mirrors palom: `len(series) > 1 or len(series[0].levels) > 1`;
+SVS/VSI always true). This is *not* `len(reader.pyramid) > 1`, which is >1 either
+way — because when a source has **no** stored pyramid, palom's `auto_format_pyramid`
+falls back to synthesising levels with `da.coarsen(np.mean, level0)`. Those
+synthesised levels are doubly bad for a mask: `np.mean` corrupts label IDs, and
+every coarse read re-computes from the full-res level 0 — a multi-GB RAM/IO spike
+(measured: napari `Labels` creation ~3.9 GB on a 13.5 GB uint32 non-pyramidal mask).
+
+So:
+- **Mask, true pyramid** → reuse the stored levels (`_add_mask_pyramidal`, cheap).
+- **Mask, non-pyramidal** → cache to a real nearest-downsampled pyramid (strided
+  slicing, not `cv2.resize`, which rejects uint32/uint64; zstd compressor). Reads
+  level 0 once in a background thread (~1.1 GB peak at 4 workers) → cheap coarse
+  levels (Labels creation 3.9 GB → 63 MB; coarse read 840 → 19 zarr reads; 97 MB
+  on disk).
+- **Image, non-pyramidal single-channel > 4096 px** → cached with INTER_AREA.
+- **Image, multi-channel / RGB** → palom levels directly (caching deferred). If the
+  source is non-pyramidal these are mean-coarsened synthesised levels (fine for
+  intensity, but coarse views re-read level 0) — same as the CLI-loaded image.
+
 The dialog's pixel size sets layer `scale`/`translate`, so all widgets (which key
 off `layer.scale`) stay consistent — the partial `--px-size` / `_px_size_override`
 mechanism is left unchanged and is not extended.
@@ -353,14 +363,13 @@ launch.py          — CLI entry point (--channels, --channel-names, --px-size);
   radius > 10), retained by the allocator and plateauing across runs. Fix later by
   capping `num_workers` or running the compute in a subprocess (the on-disk zarr is
   already the hand-off).
-- **palom synthesises pyramids**: `OmePyramidReader` derives coarse levels by
-  coarsening level 0, so reading any coarse level pulls the full-res level 0. Masks
-  work around this by always caching (decision 11), but **dropped RGB / multi-channel
-  images and the CLI-loaded image still use palom's levels directly** and therefore
-  re-read level 0 for coarse views. Caching them is deferred (the shared builder is
-  2-D only; would need to handle the channel axis). A cleaner fix would read the
-  TIFF's *stored* pyramid IFDs (e.g. via tifffile) instead of palom's synthesised
-  ones.
+- **palom's coarsen fallback for non-pyramidal sources**: when a file has no stored
+  pyramid, `OmePyramidReader` synthesises one by coarsening level 0, so each coarse
+  read pulls the full-res level 0. Masks handle this (decision 11: reuse if truly
+  pyramidal, else cache). But **non-pyramidal RGB / multi-channel images and the
+  CLI-loaded image still use palom's synthesised levels** → coarse views re-read
+  level 0. Caching them is deferred (the shared builder is 2-D only; would need to
+  handle the channel axis).
 - **Dropped masks are view-only**: dask/zarr-backed Labels aren't paintable; fine
   for combine/export, which is the intent.
 - **Drop handler hook point**: filter is on `viewer.window._qt_viewer`; may need to
