@@ -20,16 +20,15 @@ Auto-detected type (overridable in the dialog):
                                  images are piecewise-constant)
   - otherwise                  → multi-channel image
 
-Masks are always cached as a nearest-downsampled zarr pyramid (tiny on disk with
-zstd) unless the source is already pyramidal. Non-pyramidal single-channel images
-larger than 4096 px are cached with INTER_AREA. Everything else uses palom's
-levels directly.
+Non-pyramidal masks/images are cached: the reader's native level 0 stays on top
+and only the cheap coarse levels are built (nearest for masks — strided, so uint32
+labels work; INTER_AREA for images) into an in-memory zstd zarr (tens of MB, lives
+with the layer, no disk cache). Truly pyramidal sources reuse their stored levels.
 """
 
 from __future__ import annotations
 
 import os
-import tempfile
 
 import cv2
 import numpy as np
@@ -319,11 +318,17 @@ class _AddFileDialog(QDialog):
 # ── layer construction ─────────────────────────────────────────────────────── #
 
 @thread_worker
-def _build_pyramid_worker(level0, out_path, interpolation, compressor):
+def _build_pyramid_worker(level0, interpolation, compressor):
+    # Build only the cheap coarse levels into an in-memory (zstd) zarr — the
+    # caller keeps the reader's native level 0 for the top of the multiscale
+    # stack. The full-res level 0 is read once to make level 1; we skip
+    # re-compressing/re-reading and any disk cache. Coarse levels are tiny
+    # (~tens of MB compressed), so they live in RAM with the layer.
     workers = min(_CACHE_WORKERS, os.cpu_count() or 1)
-    return write_pyramid_group(level0, out_path, chunk0=2048, chunk_lo=1024,
+    return write_pyramid_group(level0, None, chunk0=2048, chunk_lo=1024,
                                n_levels=3, factor=4, interpolation=interpolation,
-                               dask_workers=workers, compressor=compressor)
+                               dask_workers=workers, compressor=compressor,
+                               store_level0=False)
 
 
 def _add_rgb(viewer, reader, px, name):
@@ -359,26 +364,28 @@ def _add_mask_pyramidal(viewer, reader, px, name):
     lyr.metadata["_palom_reader"] = reader
 
 
-def _cache_and_add(viewer, reader, px, name, *, channel, as_labels, cache_dir):
+def _cache_and_add(viewer, reader, px, name, *, channel, as_labels):
     level0 = reader.pyramid[0][channel]
     if as_labels and not np.issubdtype(level0.dtype, np.integer):
         level0 = level0.astype(np.int32)
     interp = cv2.INTER_NEAREST if as_labels else cv2.INTER_AREA
     compressor = (Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
                   if as_labels else "default")
-    out_path = os.path.join(cache_dir, f"{name}-dnd.zarr")
 
     def _done(group):
-        levels = [da.from_zarr(group[str(i)]) for i in range(len(group))]
+        # palom's native level 0 on top, cached coarse levels below.
+        coarse = [da.from_zarr(group[k]) for k in sorted(group.array_keys(), key=int)]
+        levels = [level0, *coarse]
         if as_labels:
-            viewer.add_labels(levels, name=name, multiscale=True,
-                              scale=(px, px), translate=(px / 2, px / 2))
+            lyr = viewer.add_labels(levels, name=name, multiscale=True,
+                                    scale=(px, px), translate=(px / 2, px / 2))
         else:
-            viewer.add_image(levels, name=name, multiscale=True,
-                             contrast_limits=(0, 5000),
-                             scale=(px, px), translate=(px / 2, px / 2))
+            lyr = viewer.add_image(levels, name=name, multiscale=True,
+                                   contrast_limits=(0, 5000),
+                                   scale=(px, px), translate=(px / 2, px / 2))
+        lyr.metadata["_palom_reader"] = reader   # keep level 0 readable
 
-    worker = _build_pyramid_worker(level0, out_path, interp, compressor)
+    worker = _build_pyramid_worker(level0, interp, compressor)
     worker.returned.connect(_done)
     worker.errored.connect(lambda e: print(f"DnD pyramid build error: {e}"))
     worker.start()
@@ -386,7 +393,7 @@ def _cache_and_add(viewer, reader, px, name, *, channel, as_labels, cache_dir):
 
 # ── drop handling ──────────────────────────────────────────────────────────── #
 
-def _handle_drop(viewer, path, default_px, cache_dir):
+def _handle_drop(viewer, path, default_px):
     try:
         reader = _make_reader(path)
     except Exception as e:
@@ -424,22 +431,20 @@ def _handle_drop(viewer, path, default_px, cache_dir):
             # coarsening level 0 (mean — wrong for labels — and every coarse view
             # re-reads the full-res level 0, a multi-GB spike). Cache to a real
             # pyramid with strided nearest (also handles uint32 labels).
-            _cache_and_add(viewer, reader, px, name, channel=0,
-                           as_labels=True, cache_dir=cache_dir)
+            _cache_and_add(viewer, reader, px, name, channel=0, as_labels=True)
     else:  # image
         if not pyramidal and len(channels) == 1 and max(H, W) > _CACHE_DIM_THRESHOLD:
             _cache_and_add(viewer, reader, px, name, channel=channels[0],
-                           as_labels=False, cache_dir=cache_dir)
+                           as_labels=False)
         else:
             _add_multichannel(viewer, reader, px, channels, ch_names)
 
 
 class _DropFilter(QObject):
-    def __init__(self, viewer, default_px_size, cache_dir):
+    def __init__(self, viewer, default_px_size):
         super().__init__()
         self._viewer = viewer
         self._default_px = default_px_size
-        self._cache_dir = cache_dir or tempfile.mkdtemp(prefix="masktool_dnd_")
 
     def eventFilter(self, obj, event):
         et = event.type()
@@ -456,19 +461,19 @@ class _DropFilter(QObject):
                 return False   # let napari's default readers handle it
             event.acceptProposedAction()
             for p in recognised:
-                _handle_drop(self._viewer, p, self._default_px, self._cache_dir)
+                _handle_drop(self._viewer, p, self._default_px)
             return True
         return False
 
 
-def install_drop_handler(viewer, default_px_size=None, cache_dir=None):
+def install_drop_handler(viewer, default_px_size=None):
     """Intercept drops of palom-readable files and route them through a dialog.
 
     Keeps a reference to the filter on the QtViewer so it isn't garbage-collected.
     """
     qtv = viewer.window._qt_viewer
     qtv.setAcceptDrops(True)
-    filt = _DropFilter(viewer, default_px_size, cache_dir)
+    filt = _DropFilter(viewer, default_px_size)
     qtv.installEventFilter(filt)
     qtv._mask_tool_drop_filter = filt   # keep alive
     return filt

@@ -163,8 +163,7 @@ def main(argv: list[str] | None = None) -> None:
     # Route drag-and-drop of palom-readable files through a dialog so layers get
     # the correct pixel size / type instead of napari's default eager reader.
     from mask_tool.dnd import install_drop_handler
-    install_drop_handler(viewer, default_px_size=args.px_size,
-                         cache_dir=rb_widget._cache_dir)
+    install_drop_handler(viewer, default_px_size=args.px_size)
 
     if args.params:
         import json

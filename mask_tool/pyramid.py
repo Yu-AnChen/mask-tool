@@ -54,7 +54,7 @@ def _downsample(x: "da.Array", factor: int, interpolation: int,
 
 def write_pyramid_group(
     level0: "da.Array",
-    out_path: str,
+    out_path: "str | None",
     *,
     chunk0: int = 2048,
     chunk_lo: int = 1024,
@@ -63,14 +63,17 @@ def write_pyramid_group(
     interpolation: int = cv2.INTER_AREA,
     dask_workers: int | None = None,
     compressor: object = "default",
+    store_level0: bool = True,
 ) -> "zarr.hierarchy.Group":
-    """Write `level0` (a 2-D dask array) and `n_levels-1` downsamples to a zarr
-    group as multiscale levels "0".."{n_levels-1}".
+    """Write `level0` (a 2-D dask array) and its downsamples to a zarr group as
+    multiscale levels.
 
     Parameters
     ----------
-    level0        : full-resolution 2-D dask array (level 0 is stored as-is)
-    out_path      : path for the output zarr group
+    level0        : full-resolution 2-D dask array
+    out_path      : path for the output zarr group, or None for an in-memory
+                    (RAM) zarr group — chunks stay zstd/Blosc-compressed in RAM,
+                    so tiny coarse levels need no disk cache
     chunk0        : chunk edge for level 0
     chunk_lo      : chunk edge for levels ≥ 1
     n_levels      : total number of levels including level 0
@@ -80,15 +83,25 @@ def write_pyramid_group(
     dask_workers  : threads for da.store; None → dask default
     compressor    : numcodecs codec, None (uncompressed), or "default" (zarr's
                     default Blosc); pass a zstd Blosc for label masks
+    store_level0  : if False, don't write level "0" — only the coarse levels
+                    "1".."{n_levels-1}" (level 1 is downsampled straight from the
+                    in-memory `level0`). Use when the caller already has a cheap
+                    full-res source (e.g. a reader's native level 0) and only needs
+                    cheap coarse levels; avoids re-reading/re-compressing level 0.
 
     Returns
     -------
-    The zarr group with levels "0".."{n_levels-1}".
+    The zarr group. Levels "0".."{n_levels-1}" if `store_level0`, else
+    "1".."{n_levels-1}".
     """
-    group = zarr.open_group(out_path, mode="w")
+    group = (zarr.group(store=zarr.MemoryStore()) if out_path is None
+             else zarr.open_group(out_path, mode="w"))
     dtype = level0.dtype
-    level = level0
-    for i in range(n_levels):
+    if store_level0:
+        level, first = level0, 0
+    else:
+        level, first = _downsample(level0, factor, interpolation, chunk_lo), 1
+    for i in range(first, n_levels):
         cs = chunk0 if i == 0 else chunk_lo
         level = level.rechunk((cs, cs))
         out = group.zeros(str(i), shape=level.shape, chunks=(cs, cs),

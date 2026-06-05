@@ -216,7 +216,10 @@ Cached arrays — the rolling-ball result, and dropped non-pyramidal masks/image
 are written as a 3-level multiscale zarr group (levels `"0"/"1"/"2"`, each a 4×
 downsample) via `mask_tool/pyramid.write_pyramid_group`. napari then renders
 zoomed-out views from the small coarse levels instead of pulling full-res chunks
-of a single-scale array.
+of a single-scale array. The group can be **on-disk** (`out_path=...`, rolling
+ball) or an **in-memory zstd zarr** (`out_path=None`, drag-and-drop), and
+`store_level0=False` builds only the coarse levels when the caller already has a
+cheap full-res source for the top of the stack.
 
 Levels are written one at a time, each read back from disk before producing the
 next, so an expensive level-0 graph (e.g. the rolling ball) is computed once and
@@ -264,12 +267,15 @@ every coarse read re-computes from the full-res level 0 — a multi-GB RAM/IO sp
 
 So:
 - **Mask, true pyramid** → reuse the stored levels (`_add_mask_pyramidal`, cheap).
-- **Mask, non-pyramidal** → cache to a real nearest-downsampled pyramid (strided
-  slicing, not `cv2.resize`, which rejects uint32/uint64; zstd compressor). Reads
-  level 0 once in a background thread (~1.1 GB peak at 4 workers) → cheap coarse
-  levels (Labels creation 3.9 GB → 63 MB; coarse read 840 → 19 zarr reads; 97 MB
-  on disk).
-- **Image, non-pyramidal single-channel > 4096 px** → cached with INTER_AREA.
+- **Mask, non-pyramidal** → keep the reader's native level 0 on top and build only
+  the coarse levels (nearest via strided slicing — `cv2.resize` rejects
+  uint32/uint64) into an **in-memory zstd zarr** (`out_path=None,
+  store_level0=False`). Reads level 0 once in a background thread (~1 GB peak at
+  4 workers, ~6 s) → coarse levels are tens of MB in RAM (18 MB for the 13.5 GB
+  test mask), no disk cache. napari uses the cached coarse for thumbnail/overview
+  and palom's level 0 only when zoomed to full res (Labels creation ~3.9 GB → 63 MB).
+- **Image, non-pyramidal single-channel > 4096 px** → same coarse-only in-memory
+  cache with INTER_AREA (palom level 0 on top).
 - **Image, multi-channel / RGB** → palom levels directly (caching deferred). If the
   source is non-pyramidal these are mean-coarsened synthesised levels (fine for
   intensity, but coarse views re-read level 0) — same as the CLI-loaded image.
