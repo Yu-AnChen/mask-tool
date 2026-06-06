@@ -259,18 +259,26 @@ Type auto-detection (overridable):
 - otherwise → **multi-channel image** (`channel_axis` split, reversed order/names
   like the CLI loader).
 
-Reuse-vs-cache hinges on whether the **source** stores a real pyramid, detected by
-`_is_pyramidal(path)` (mirrors palom: `len(series) > 1 or len(series[0].levels) > 1`;
-SVS/VSI always true). This is *not* `len(reader.pyramid) > 1`, which is >1 either
-way — because when a source has **no** stored pyramid, palom's `auto_format_pyramid`
-falls back to synthesising levels with `da.coarsen(np.mean, level0)`. Those
-synthesised levels are doubly bad for a mask: `np.mean` corrupts label IDs, and
-every coarse read re-computes from the full-res level 0 — a multi-GB RAM/IO spike
-(measured: napari `Labels` creation ~3.9 GB on a 13.5 GB uint32 non-pyramidal mask).
+Reuse-vs-cache hinges on whether palom **synthesised** the coarse levels (vs. read
+real stored ones), detected by `_is_synthesized(reader.pyramid)`. This is *not*
+`len(reader.pyramid) > 1`, which is >1 either way — because when a source has **no**
+stored pyramid, palom's `auto_format_pyramid` falls back to synthesising levels with
+`da.coarsen(np.mean, level0)`. Those synthesised levels are doubly bad for a mask:
+`np.mean` corrupts label IDs, and every coarse read re-computes from the full-res
+level 0 — a multi-GB RAM/IO spike (measured: napari `Labels` creation ~3.9 GB on a
+13.5 GB uint32 non-pyramidal mask).
+
+`_is_synthesized` works off the **dask graph**, not the file: palom builds every
+synthesised level from level 0, so the coarsest level's graph shares layers with
+level 0's, whereas independently-read stored levels share none. This is
+reader-agnostic (tiff / svs / vsi / anything palom returns) and avoids a second
+file open — replacing the earlier tiff-specific `_is_pyramidal(path)` (which
+re-opened the file and special-cased SVS/VSI). The same boolean is threaded into
+detection's coarse-locate (see 12) and every add-path below.
 
 So:
 - **Mask, true pyramid** → reuse the stored levels (`_add_mask_pyramidal`, cheap).
-- **Mask, non-pyramidal** → keep the reader's native level 0 on top and build the
+- **Mask, synthesised** → keep the reader's native level 0 on top and build the
   coarse levels (factor 2, down to ≤ ~1024 px; nearest via strided slicing —
   `cv2.resize` rejects uint32/uint64) into an **in-memory zstd zarr**
   (`out_path=None, store_level0=False`). Reads level 0 once in a background thread
@@ -282,11 +290,14 @@ So:
   - While building, a faint footprint-sized `"{name} (building…)"` placeholder
     layer + a notification show progress; the real layer replaces it on completion.
     `_BUILDING` guards against re-dropping the same file mid-build.
-- **Image, non-pyramidal single-channel > 4096 px** → same coarse-only in-memory
+- **Image, synthesised single-channel > 4096 px** → same coarse-only in-memory
   cache with INTER_AREA (palom level 0 on top).
-- **Image, multi-channel / RGB** → palom levels directly (caching deferred). If the
-  source is non-pyramidal these are mean-coarsened synthesised levels (fine for
-  intensity, but coarse views re-read level 0) — same as the CLI-loaded image.
+- **Image, multi-channel / RGB** → real stored levels are used as a multiscale
+  layer; synthesised sources load **single-scale** (level 0 only) rather than build
+  a multiscale stack whose coarse views re-read level 0. Per-channel coarse caching
+  (the mask/single-channel treatment, but `write_pyramid_group` is 2-D only) is
+  deferred — large non-pyramidal multi-channel/RGB therefore renders without cheap
+  overview levels. See "Open / deferred".
 
 The dialog's pixel size sets layer `scale`/`translate`, so all widgets (which key
 off `layer.scale`) stay consistent — the partial `--px-size` / `_px_size_override`
@@ -300,9 +311,13 @@ discriminator is the fraction of neighbouring **foreground** pixels (both nonzer
 that are identical — ~0.9+ for masks regardless of label count or object size,
 ~0.01 for intensity. Excluding background is essential: a cropped FOV with large
 zero regions would otherwise false-positive. The metric is computed on full-res
-sample tiles located via the coarsest pyramid level (densest tissue first), so
-detection ignores the glass/exterior that dominates a WSI's top-left. Threshold
-0.5; falls back to the integer-dtype rule when content is too sparse to judge.
+sample tiles located via a coarse foreground map (densest tissue first), so
+detection ignores the glass/exterior that dominates a WSI's top-left. That map
+comes from a real stored coarse level when one exists, else a strided sample of
+level 0 — never `reader.pyramid[-1]` of a **synthesised** pyramid, which would
+force palom to coarsen the entire level 0 (a full-res read) just to locate
+content. Threshold 0.5; falls back to the integer-dtype rule when content is too
+sparse to judge.
 (Compression ratio was considered but rejected — it conflates piecewise-constancy
 with storage bit-depth.)
 
@@ -379,11 +394,13 @@ launch.py          — CLI entry point (--channels, --channel-names, --px-size);
   already the hand-off).
 - **palom's coarsen fallback for non-pyramidal sources**: when a file has no stored
   pyramid, `OmePyramidReader` synthesises one by coarsening level 0, so each coarse
-  read pulls the full-res level 0. Masks handle this (decision 11: reuse if truly
-  pyramidal, else cache). But **non-pyramidal RGB / multi-channel images and the
-  CLI-loaded image still use palom's synthesised levels** → coarse views re-read
-  level 0. Caching them is deferred (the shared builder is 2-D only; would need to
-  handle the channel axis).
+  read pulls the full-res level 0. Masks and single-channel images handle this
+  (decision 11: reuse stored levels if not synthesised, else build a coarse cache).
+  Dropped **RGB / multi-channel** synthesised sources now load **single-scale**
+  (level 0 only) to avoid the re-read, but get **no cheap overview** — per-channel
+  coarse caching is deferred (the shared builder is 2-D only; would need to loop
+  the channel axis and stack). The **CLI-loaded image** still uses palom's
+  synthesised levels directly.
 - **Dropped masks are view-only**: dask/zarr-backed Labels aren't paintable; fine
   for combine/export, which is the intent.
 - **Drop handler hook point**: filter is on `viewer.window._qt_viewer`; may need to

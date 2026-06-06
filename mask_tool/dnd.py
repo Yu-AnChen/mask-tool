@@ -85,24 +85,26 @@ def _make_reader(path: str, pixel_size: float | None = None):
     return R.OmePyramidReader(path, pixel_size=pixel_size)
 
 
-def _is_pyramidal(path: str) -> bool:
-    """True if the file stores real pyramid levels (mirrors palom's own check).
+def _is_synthesized(pyr) -> bool:
+    """True if palom synthesised the coarse levels by coarsening level 0 (vs.
+    reading real stored levels).
 
-    palom's OmePyramidReader uses stored levels when present, but otherwise falls
-    back to synthesising a pyramid by coarsening level 0 (da.coarsen) — in which
-    case `reader.pyramid` still has >1 level, but every coarse level re-reads the
-    full-res level 0. So `len(reader.pyramid) > 1` cannot tell the two apart; we
-    check the source directly.
+    palom's `DaPyramidChannelReader.auto_format_pyramid` returns stored levels
+    as-is when the source has >1 level, but otherwise synthesises a pyramid with
+    `da.coarsen(np.mean, level0, …)` — so every coarse level re-reads the full-res
+    level 0 (a multi-GB spike, and the mean is wrong for label masks). Crucially
+    `len(pyr) > 1` is True in *both* cases and cannot tell them apart.
+
+    The synthesised levels are all built on level 0, so the coarsest level's dask
+    graph shares layers with level 0's; independently-read stored levels share
+    none. Checking the graph is reader-agnostic (tiff / svs / vsi / anything
+    palom returns) and needs no second file open.
     """
-    low = path.lower()
-    if low.endswith((".svs", ".vsi")):
-        return True   # these readers expose real pyramid levels
-    try:
-        import tifffile
-        with tifffile.TiffFile(path) as tf:
-            return len(tf.series) > 1 or len(tf.series[0].levels) > 1
-    except Exception:
+    if len(pyr) < 2:
         return False
+    base = set(pyr[0].__dask_graph__().layers)
+    top = set(pyr[-1].__dask_graph__().layers)
+    return bool(base & top)
 
 
 def _channel_names(path: str, n: int) -> list[str]:
@@ -133,7 +135,7 @@ def _equal_fg_pairs(a: np.ndarray) -> tuple[int, int]:
     return int(eq_r.sum() + eq_d.sum()), int(nz_r.sum() + nz_d.sum())
 
 
-def _foreground_equality(reader, channel: int = 0) -> float | None:
+def _foreground_equality(reader, synthesized: bool, channel: int = 0) -> float | None:
     """Fraction of neighbouring foreground pixels that are identical, measured on
     full-res sample tiles located via the coarsest pyramid level (densest tissue
     first). Returns None if the content is too sparse to judge."""
@@ -143,8 +145,12 @@ def _foreground_equality(reader, channel: int = 0) -> float | None:
 
     # Coarse foreground map to find where the tissue/labels are. The coarse level
     # is only used to *locate* content; the metric is always computed full-res
-    # (averaged coarse levels would destroy piecewise-constancy).
-    if len(pyr) > 1:
+    # (averaged coarse levels would destroy piecewise-constancy). Read a real
+    # stored coarse level when one exists; for a synthesised pyramid (or none)
+    # take a strided sample of full-res instead — reading `pyr[-1]` would force
+    # palom to coarsen the *entire* level 0 just to locate content (a full-res
+    # read, the very spike the cache path exists to avoid).
+    if len(pyr) > 1 and not synthesized:
         coarse = np.asarray(pyr[-1][channel])
     else:
         s = max(1, max(H, W) // 2048)
@@ -175,7 +181,7 @@ def _foreground_equality(reader, channel: int = 0) -> float | None:
     return eq / tot
 
 
-def _detect_type(reader) -> tuple[str, float | None]:
+def _detect_type(reader, synthesized: bool) -> tuple[str, float | None]:
     """Return ("rgb" | "mask" | "image", equality_score_or_None)."""
     p0 = reader.pyramid[0]
     C = int(p0.shape[0])
@@ -183,7 +189,7 @@ def _detect_type(reader) -> tuple[str, float | None]:
     if C == 3 and dtype == np.uint8:
         return "rgb", None
     if C == 1:
-        score = _foreground_equality(reader)
+        score = _foreground_equality(reader, synthesized)
         if score is None:
             return ("mask" if np.issubdtype(dtype, np.integer) else "image"), None
         return ("mask" if score > _EQ_THRESHOLD else "image"), score
@@ -353,18 +359,22 @@ def _build_pyramid_worker(level0, interpolation, compressor):
                                store_level0=False)
 
 
-def _add_rgb(viewer, reader, px, name):
+def _add_rgb(viewer, reader, px, name, synthesized=False):
     pyr = [da.moveaxis(lvl, 0, -1) for lvl in reader.pyramid]   # (H,W,3)
-    multiscale = len(pyr) > 1
+    # Don't build a multiscale stack from palom's synthesised levels — each coarse
+    # view would re-read the full-res level 0. Fall back to single-scale instead.
+    multiscale = len(pyr) > 1 and not synthesized
     lyr = viewer.add_image(pyr if multiscale else pyr[0], name=name, rgb=True,
                            multiscale=multiscale,
                            scale=(px, px), translate=(px / 2, px / 2))
     lyr.metadata["_palom_reader"] = reader
 
 
-def _add_multichannel(viewer, reader, px, channels, ch_names):
+def _add_multichannel(viewer, reader, px, channels, ch_names, synthesized=False):
     pyr = [lvl[channels] for lvl in reader.pyramid]
-    multiscale = len(pyr) > 1
+    # Synthesised coarse levels re-read full-res level 0 per view; load single-
+    # scale rather than build a multiscale stack on top of them.
+    multiscale = len(pyr) > 1 and not synthesized
     names = [ch_names[i] for i in channels]
     data = [lvl[::-1] for lvl in pyr] if multiscale else pyr[0][::-1]
     lyrs = viewer.add_image(data, channel_axis=0, name=names[::-1],
@@ -460,7 +470,12 @@ def _handle_drop(viewer, path, default_px):
     try:
         p0 = reader.pyramid[0]
         C, H, W = int(p0.shape[0]), int(p0.shape[-2]), int(p0.shape[-1])
-        detected, score = _detect_type(reader)
+        # Did palom synthesise the coarse levels (coarsen of level 0) rather than
+        # read real stored ones? Decides detection's coarse-locate read and which
+        # add-path to take below — NOT len(reader.pyramid), which is >1 in both
+        # cases.
+        synthesized = _is_synthesized(reader.pyramid)
+        detected, score = _detect_type(reader, synthesized)
         file_px = reader.pixel_size
         prefill = file_px if file_px and file_px > 0 else (default_px or 1.0)
         ch_names = _channel_names(path, C)
@@ -475,27 +490,24 @@ def _handle_drop(viewer, path, default_px):
 
     typ, px, channels = dlg.layer_type(), dlg.pixel_size(), dlg.channels()
     name = _layer_name(path)
-    # True stored pyramid vs palom's coarsen fallback — NOT len(reader.pyramid),
-    # which is >1 in both cases.
-    pyramidal = _is_pyramidal(path)
 
     if typ == "rgb":
-        _add_rgb(viewer, reader, px, name)
+        _add_rgb(viewer, reader, px, name, synthesized)
     elif typ == "mask":
-        if pyramidal:
+        if not synthesized:
             _add_mask_pyramidal(viewer, reader, px, name)   # real cheap levels
         else:
-            # Non-pyramidal source: palom would synthesise coarse levels by
-            # coarsening level 0 (mean — wrong for labels — and every coarse view
-            # re-reads the full-res level 0, a multi-GB spike). Cache to a real
-            # pyramid with strided nearest (also handles uint32 labels).
+            # Synthesised source: palom would build coarse levels by coarsening
+            # level 0 (mean — wrong for labels — and every coarse view re-reads
+            # the full-res level 0, a multi-GB spike). Cache to a real pyramid
+            # with strided nearest (also handles uint32 labels).
             _cache_and_add(viewer, reader, px, name, channel=0, as_labels=True)
     else:  # image
-        if not pyramidal and len(channels) == 1 and max(H, W) > _CACHE_DIM_THRESHOLD:
+        if synthesized and len(channels) == 1 and max(H, W) > _CACHE_DIM_THRESHOLD:
             _cache_and_add(viewer, reader, px, name, channel=channels[0],
                            as_labels=False)
         else:
-            _add_multichannel(viewer, reader, px, channels, ch_names)
+            _add_multichannel(viewer, reader, px, channels, ch_names, synthesized)
 
 
 class _DropFilter(QObject):
