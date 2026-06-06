@@ -401,9 +401,12 @@ def _add_placeholder(viewer, name, shape, px):
     sees it's working (and doesn't re-drop). Replaced by the real layer when done."""
     H, W = int(shape[-2]), int(shape[-1])
     block = np.full((16, 16), 128, np.uint8)
+    sy, sx = H * px / 16, W * px / 16
+    # translate is half the block's *own* scale (per axis), so its top-left corner
+    # lands at world (0,0) — matching the real layer's footprint [0,H·px]×[0,W·px].
     return viewer.add_image(block, name=f"{name} (building…)",
-                            scale=(H * px / 16, W * px / 16),
-                            translate=(px / 2, px / 2), colormap="gray",
+                            scale=(sy, sx),
+                            translate=(sy / 2, sx / 2), colormap="gray",
                             contrast_limits=(0, 255), opacity=0.25,
                             blending="translucent")
 
