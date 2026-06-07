@@ -106,7 +106,15 @@ def write_pyramid_group(
         level = level.rechunk((cs, cs))
         out = group.zeros(str(i), shape=level.shape, chunks=(cs, cs),
                           dtype=dtype, compressor=compressor)
-        da.store(level, out, scheduler="threads", num_workers=dask_workers)
+        # callbacks=[] keeps this store out of dask's *global* callbacks. napari
+        # registers a process-global opportunistic `dask.cache.Cache` while it
+        # slices dask layers; that cache's callbacks aren't safe across two
+        # concurrent dask schedulers, so a background build racing a foreground
+        # slice corrupts its `starttimes` → KeyError. Passing a non-None list
+        # makes dask use no callbacks here and skip the global-callback swap,
+        # isolating this store from (and not interfering with) napari's reads.
+        da.store(level, out, scheduler="threads", num_workers=dask_workers,
+                 callbacks=[])
         if i < n_levels - 1:
             level = _downsample(da.from_zarr(out), factor, interpolation, chunk_lo)
     return group

@@ -235,7 +235,11 @@ def subtract_background(
     # In-memory result (no caching): single-level zarr array, as before.
     if out_path is None:
         out_arr = zarr.zeros(x.shape, chunks=(chunk_size, chunk_size), dtype=src_dtype)
-        da.store(result, out_arr, scheduler="threads", num_workers=dask_workers)
+        # callbacks=[] isolates this store from napari's process-global dask
+        # `Cache` callbacks, which aren't safe when a background compute races a
+        # foreground slice (corrupted `starttimes` → KeyError). See pyramid.py.
+        da.store(result, out_arr, scheduler="threads", num_workers=dask_workers,
+                 callbacks=[])
         return out_arr
 
     # Cached result: 3-level multiscale zarr group. Level 0 is the full-res
