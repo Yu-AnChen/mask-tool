@@ -24,6 +24,62 @@ import argparse
 import napari
 
 
+def _warm_palom_import() -> None:
+    """Warm `import palom.reader` on a daemon thread so the first drag-and-drop
+    doesn't stall on it.
+
+    Drag-and-drop imports palom lazily (`mask_tool.dnd._make_reader`). That cold
+    import runs `palom/__init__`, which pulls in `palom.align` → scikit-learn
+    (~2.4 s total) even though the mask tool never aligns. When launched without
+    an image nothing imports palom at startup, so the first drop pays the whole
+    cost. Kicking it off here overlaps it with napari's startup; by drop time it's
+    resolved (a no-op re-import). Best-effort — if it fails, the real drop surfaces
+    the error normally.
+    """
+    import threading
+    threading.Thread(target=lambda: __import__("palom.reader"),
+                     daemon=True, name="warm-palom").start()
+
+
+def _install_timestamped_notifications() -> None:
+    """Prefix napari's console notification echo with an HH:MM:SS timestamp.
+
+    `show_info`/`show_warning`/etc. dispatch through `notification_manager`, and
+    napari connects `show_console_notification` to it — which does
+    `print(notification)` (e.g. ``INFO: '…' ready``) with no time. We disconnect
+    that plain handler and connect one that mirrors napari's severity-level
+    filtering but prepends the time, so the terminal log is easy to follow.
+
+    Must run after the Qt app exists (napari connects the console handler when the
+    first `napari.Viewer()` is created), otherwise the disconnect is a no-op and
+    both handlers fire (double lines).
+    """
+    import datetime
+    from napari.utils.notifications import notification_manager
+    try:
+        from napari.utils.notifications import show_console_notification
+    except ImportError:
+        show_console_notification = None
+
+    def _timestamped(notification) -> None:
+        try:
+            from napari.settings import get_settings
+            if (notification.severity
+                    < get_settings().application.console_notification_level):
+                return
+            print(f"[{datetime.datetime.now():%H:%M:%S}] {notification}")
+        except Exception:
+            pass
+
+    emitter = notification_manager.notification_ready
+    if show_console_notification is not None:
+        try:
+            emitter.disconnect(show_console_notification)
+        except Exception:
+            pass   # not connected (e.g. headless) — nothing to replace
+    emitter.connect(_timestamped)
+
+
 def _load_image(
     path: str,
     viewer: napari.Viewer,
@@ -92,6 +148,8 @@ def _load_image(
 
 
 def main(argv: list[str] | None = None) -> None:
+    _warm_palom_import()   # overlap palom's ~2.4s cold import with startup
+
     parser = argparse.ArgumentParser(description="napari mask builder")
     parser.add_argument("image", nargs="?", help="Path to OME-TIFF")
     parser.add_argument(
@@ -128,6 +186,7 @@ def main(argv: list[str] | None = None) -> None:
             )
 
     viewer = napari.Viewer(title="Mask Builder")
+    _install_timestamped_notifications()
 
     if args.image:
         _load_image(
