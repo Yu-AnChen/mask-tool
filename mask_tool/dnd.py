@@ -29,6 +29,7 @@ with the layer, no disk cache). Truly pyramidal sources reuse their stored level
 from __future__ import annotations
 
 import os
+import math
 
 import cv2
 import numpy as np
@@ -58,9 +59,13 @@ _BUILDING: set = set()
 _RECOGNISED = (".ome.tif", ".ome.tiff", ".tif", ".tiff", ".qptiff", ".svs", ".vsi")
 
 _EQ_THRESHOLD = 0.5          # foreground-equality above this → mask
-_DETECT_WINDOW = 1024        # full-res sample tile edge (px)
-_DETECT_MAX_TILES = 6        # cap full-res tiles read during detection
+_DETECT_WINDOW = 1024        # full-res sample tile edge (px), coarse-map fallback
+_DETECT_MAX_TILES = 6        # cap foreground tiles whose pairs we accumulate
 _DETECT_MIN_PAIRS = 100_000  # accumulate foreground pairs up to this
+_DETECT_PROBE_TILES = 48     # max chunk-aligned tiles the sparse sampler reads
+                             # before giving up and using the coarse map
+_DETECT_TILE_MIN_FG = 0.01   # skip probe tiles whose foreground fraction is below
+                             # this (≈ glass / background-only tiles)
 _CACHE_DIM_THRESHOLD = 4096  # non-pyramidal images larger than this get cached
 _CACHE_WORKERS = 4           # dask threads for the cache build; capped because the
                              # downsample is I/O-bound, and peak RAM ∝ workers
@@ -135,27 +140,65 @@ def _equal_fg_pairs(a: np.ndarray) -> tuple[int, int]:
     return int(eq_r.sum() + eq_d.sum()), int(nz_r.sum() + nz_d.sum())
 
 
-def _foreground_equality(reader, synthesized: bool, channel: int = 0) -> float | None:
-    """Fraction of neighbouring foreground pixels that are identical, measured on
-    full-res sample tiles located via the coarsest pyramid level (densest tissue
-    first). Returns None if the content is too sparse to judge."""
+def _lds_order(n: int) -> list[int]:
+    """A well-spread visiting order of ``range(n)``: a golden-ratio coprime stride
+    (a low-discrepancy sequence), so probes scatter across the tile grid instead
+    of clumping in one corner. Deterministic, no RNG."""
+    if n <= 2:
+        return list(range(n))
+    k = max(1, round(n / 1.618033988749895))
+    while k < n and math.gcd(k, n) != 1:
+        k += 1
+    if math.gcd(k, n) != 1:
+        return list(range(n))
+    return [(i * k) % n for i in range(n)]
+
+
+def _sparse_foreground_equality(full, H: int, W: int) -> float | None:
+    """Fast path: probe chunk-aligned full-res tiles in a spread order, skipping
+    near-empty (glass) tiles, until enough foreground pairs accumulate. Reads only
+    a handful of tiles — no whole-image read. Returns the equality fraction, or
+    None if it can't find enough foreground within `_DETECT_PROBE_TILES` reads
+    (caller then falls back to the deterministic coarse map)."""
+    th, tw = max(1, int(full.chunksize[0])), max(1, int(full.chunksize[1]))
+    n_ty, n_tx = max(1, -(-H // th)), max(1, -(-W // tw))   # ceil-div tile counts
+
+    eq = tot = used = read = 0
+    for idx in _lds_order(n_ty * n_tx):
+        if used >= _DETECT_MAX_TILES or tot >= _DETECT_MIN_PAIRS:
+            break
+        if read >= _DETECT_PROBE_TILES:
+            break
+        ty, tx = divmod(idx, n_tx)
+        win = np.asarray(full[ty * th:ty * th + th, tx * tw:tx * tw + tw])
+        read += 1
+        if win.size == 0 or (win != 0).mean() < _DETECT_TILE_MIN_FG:
+            continue   # background-only tile — doesn't count toward the metric
+        e, t = _equal_fg_pairs(win)
+        eq += e
+        tot += t
+        used += 1
+
+    return eq / tot if tot >= _DETECT_MIN_PAIRS // 10 else None
+
+
+def _coarse_foreground_equality(reader, synthesized: bool, channel: int) -> float | None:
+    """Deterministic fallback: locate the densest tiles via a coarse foreground
+    map, then measure equality on full-res windows there. Used only when the
+    sparse sampler can't find enough foreground (e.g. a tiny tissue fragment that
+    random probing missed). Reads a real stored coarse level when one exists; for
+    a synthesised pyramid (or none) takes a strided sample of full-res — reading
+    `pyr[-1]` would force palom to coarsen the *entire* level 0 (the spike the
+    cache path avoids)."""
     pyr = reader.pyramid
     full = pyr[0][channel]
     H, W = int(full.shape[-2]), int(full.shape[-1])
 
-    # Coarse foreground map to find where the tissue/labels are. The coarse level
-    # is only used to *locate* content; the metric is always computed full-res
-    # (averaged coarse levels would destroy piecewise-constancy). Read a real
-    # stored coarse level when one exists; for a synthesised pyramid (or none)
-    # take a strided sample of full-res instead — reading `pyr[-1]` would force
-    # palom to coarsen the *entire* level 0 just to locate content (a full-res
-    # read, the very spike the cache path exists to avoid).
     if len(pyr) > 1 and not synthesized:
         coarse = np.asarray(pyr[-1][channel])
     else:
         s = max(1, max(H, W) // 2048)
         coarse = np.asarray(full[::s, ::s])
-
     n_ty = max(1, H // _DETECT_WINDOW)
     n_tx = max(1, W // _DETECT_WINDOW)
     tile_fg = cv2.resize((coarse != 0).astype(np.float32), (n_tx, n_ty),
@@ -176,9 +219,24 @@ def _foreground_equality(reader, synthesized: bool, channel: int = 0) -> float |
         tot += t
         used += 1
 
-    if tot < _DETECT_MIN_PAIRS // 10:
-        return None
-    return eq / tot
+    return eq / tot if tot >= _DETECT_MIN_PAIRS // 10 else None
+
+
+def _foreground_equality(reader, synthesized: bool, channel: int = 0) -> float | None:
+    """Fraction of neighbouring foreground pixels that are identical (label masks
+    are piecewise-constant → ~1; intensity images → ~0). Returns None if content
+    is too sparse to judge.
+
+    Sparse-sample a few full-res tiles first (cheap — no whole-image read); only
+    if that can't find enough foreground do we read the coarse map to locate a
+    small tissue region deterministically.
+    """
+    full = reader.pyramid[0][channel]
+    H, W = int(full.shape[-2]), int(full.shape[-1])
+    score = _sparse_foreground_equality(full, H, W)
+    if score is not None:
+        return score
+    return _coarse_foreground_equality(reader, synthesized, channel)
 
 
 def _detect_type(reader, synthesized: bool) -> tuple[str, float | None]:
