@@ -139,8 +139,6 @@ def _load_image(
         translate=(px * 0.5, px * 0.5),
     )
     viewer.title = pathlib.Path(path).stem
-    viewer.scale_bar.visible = True
-    viewer.scale_bar.unit = "um"
     print(f"Loaded {path}")
     print(f"  pixel size : {px} µm")
     print(f"  channels   : {channel_names}")
@@ -187,6 +185,10 @@ def main(argv: list[str] | None = None) -> None:
 
     viewer = napari.Viewer(title="Mask Builder")
     _install_timestamped_notifications()
+    # Always show a µm scale bar — layers carry physical scale (palom pixel size,
+    # or the drag-and-drop dialog), so it stays correct even with no image loaded.
+    viewer.scale_bar.visible = True
+    viewer.scale_bar.unit = "um"
 
     if args.image:
         _load_image(
