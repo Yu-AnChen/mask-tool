@@ -305,6 +305,14 @@ mechanism is left unchanged and is not extended.
 
 ### 12. Mask-vs-intensity detection by foreground equality
 
+The algorithm lives in `mask_tool/mask_detect.py` — self-contained (no Qt/napari),
+usable as a library (`from mask_tool.mask_detect import classify,
+foreground_equality`) or CLI (`python -m mask_tool.mask_detect IMG`), and accepting
+a file path, a palom reader, or a raw 2-D/3-D array. `dnd.py` imports
+`foreground_equality` + `is_synthesized` from it and keeps only its layer-type
+policy (`_detect_type`: rgb / 1-channel→equality / multichannel→image), so there is
+a single source of truth.
+
 A label mask is piecewise-constant (every pixel inside an object equals its
 neighbours; only boundaries differ); an intensity image has per-pixel noise. The
 discriminator is the fraction of neighbouring **foreground** pixels (both nonzero)
@@ -312,23 +320,24 @@ that are identical — ~0.9+ for masks regardless of label count or object size,
 ~0.01 for intensity. Excluding background is essential: a cropped FOV with large
 zero regions would otherwise false-positive. The metric is always computed on
 full-res tiles (averaging a coarse level would destroy piecewise-constancy), and
-accumulated over tiles until ~100k foreground pairs. Threshold 0.5; falls back to
-the integer-dtype rule when content is too sparse to judge. (Compression ratio was
-considered but rejected — it conflates piecewise-constancy with storage bit-depth.)
+accumulated over tiles until ~100k foreground pairs (`MIN_PAIRS`). Threshold 0.5;
+falls back to the integer-dtype rule when content is too sparse to judge.
+(Compression ratio was considered but rejected — it conflates piecewise-constancy
+with storage bit-depth.)
 
 **Locating tissue — sparse sampler, coarse map as fallback.** Detection must avoid
 the glass/exterior that dominates a WSI's top-left. The fast path
-(`_sparse_foreground_equality`) probes **chunk-aligned full-res tiles in a
-low-discrepancy order** (`_lds_order`: a golden-ratio coprime stride, so probes
-scatter across the grid), skips near-empty tiles, and stops once it has enough
-foreground pairs — reading only a handful of tiles (1–2 for dense content), **no
-whole-image read**. Only if it can't find enough foreground within
-`_DETECT_PROBE_TILES` (48) reads does it fall back to `_coarse_foreground_equality`,
-which builds a coarse foreground map to locate the densest tiles deterministically
-(for a tiny tissue fragment random probing might miss). That coarse map comes from
-a real stored coarse level when one exists, else a strided sample of level 0 —
-never `reader.pyramid[-1]` of a **synthesised** pyramid, which would force palom to
-coarsen the entire level 0 (a full-res read) just to locate content.
+(`_sparse_equality`) probes **chunk-aligned full-res tiles in a low-discrepancy
+order** (`lds_order`: a golden-ratio coprime stride, so probes scatter across the
+grid), skips near-empty tiles, and stops once it has enough foreground pairs —
+reading only a handful of tiles (1–2 for dense content), **no whole-image read**.
+Only if it can't find enough foreground within `PROBE_TILES` (48) reads does it
+fall back to `_coarse_equality`, which builds a coarse foreground map to locate the
+densest tiles deterministically (for a tiny tissue fragment random probing might
+miss). `dnd` passes that fallback a real stored coarse level when one exists, else
+None → a strided sample of level 0; it never hands over `reader.pyramid[-1]` of a
+**synthesised** pyramid, which would force palom to coarsen the entire level 0 (a
+full-res read) just to locate content.
 
 This was the motivation: on a 39760×84959 non-pyramidal mask the old coarse-first
 path read the whole level 0 (~3 s, *before* the dialog appears); the sampler cuts
